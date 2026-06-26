@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -303,6 +303,80 @@ test('planEpicBatches: partitions cover every slice exactly once (no drops)', ()
   const all = batches.flatMap(b => b.sliceIds)
   assert.equal(all.length, 16)
   assert.equal(new Set(all).size, 16) // every slice present once
+})
+
+// --- parseArgs ---------------------------------------------------------------
+// Normalizes the workflow's `args` input (object / JSON string / CLI string /
+// missing) into a structured config. The CLI-string branch is the regression
+// fix: when the slash-command bridge forwards the RAW argument string verbatim
+// (e.g. "go --input /src/mulch") instead of a built object, parsing must still
+// recover inputDir/target — otherwise the run drifts to SOURCE="." (cwd).
+
+test('parseArgs: object passed through unchanged (happy path)', () => {
+  const { parseArgs } = loadDeterministic()
+  const o = { inputDir: '/src/mulch', target: 'go', outputDir: '/out' }
+  assert.equal(parseArgs(o), o) // same reference — no copy, no mangling
+})
+
+test('parseArgs: JSON object string is parsed', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('{"inputDir":"/src/mulch","target":"go"}'),
+    { inputDir: '/src/mulch', target: 'go' })
+})
+
+test('parseArgs: regression — raw CLI string "<target> --input <dir>"', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('go --input /Users/x/reference/mulch'),
+    { target: 'go', inputDir: '/Users/x/reference/mulch' })
+})
+
+test('parseArgs: positional target + positional input dir', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('rust /src/mulch'),
+    { target: 'rust', inputDir: '/src/mulch' })
+})
+
+test('parseArgs: --input flag wins over positional input dir', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('go /positional --input /flagged'),
+    { target: 'go', inputDir: '/flagged' })
+})
+
+test('parseArgs: --output and its aliases map to outputDir', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.equal(parseArgs('go --output /a').outputDir, '/a')
+  assert.equal(parseArgs('go --out /b').outputDir, '/b')
+  assert.equal(parseArgs('go --outputDir /c').outputDir, '/c')
+})
+
+test('parseArgs: --flag=value form', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('go --input=/src/mulch --output=/out'),
+    { target: 'go', inputDir: '/src/mulch', outputDir: '/out' })
+})
+
+test('parseArgs: unknown tuning knobs pass through (camelCase preserved)', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.equal(parseArgs('go --input /m --maxEpics 50').maxEpics, '50')
+})
+
+test('parseArgs: --target flag wins over positional', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.equal(parseArgs('/src/mulch --target go').target, 'go')
+})
+
+test('parseArgs: empty / missing / non-string-non-object -> {}', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs(''), {})
+  assert.deepEqual(parseArgs('   '), {})
+  assert.deepEqual(parseArgs(undefined), {})
+  assert.deepEqual(parseArgs(null), {})
+  assert.deepEqual(parseArgs(42), {})
+})
+
+test('parseArgs: bare target only', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.deepEqual(parseArgs('go'), { target: 'go' })
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only

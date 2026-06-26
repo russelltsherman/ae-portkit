@@ -1,7 +1,7 @@
 {
   "name": "portkit",
   "description": "Analyze a codebase into a target-neutral, vertical-slice build kit so a weaker downstream model can recreate the project in a different language or framework.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Russell Sherman",
     "url": "https://github.com/russelltsherman"

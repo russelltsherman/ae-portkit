@@ -16,13 +16,12 @@ export const meta = {
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
-// args may arrive as an object (from the slash command / a hand call), a JSON
-// string, or undefined. Normalize once; parse only when it is a string.
-const input = typeof args === 'string'
-  ? (() => { try { return JSON.parse(args) } catch { return args } })()
-  : (args ?? {})
-
-const cfg = (typeof input === 'object' && input) ? input : {}
+// args may arrive as a structured object (from the slash command / a hand call),
+// a JSON string, a raw CLI string forwarded by the skill/command bridge (e.g.
+// "go --input /src/mulch"), or undefined. parseArgs() (deterministic region)
+// normalizes all of them to a config object — crucially recovering inputDir/target
+// from the CLI-string form so the run never silently drifts to the cwd.
+const cfg = parseArgs(args)
 // Input dir. Preferred name: inputDir; legacy fallback: sourcePath.
 const SOURCE = cfg.inputDir || cfg.sourcePath || '.'
 // Single target language/framework (optional; empty = neutral-core-only run).
@@ -110,6 +109,67 @@ function pad(n) { return String(n).padStart(4, '0') }
 // verbatim and unit-tested by portkit.deterministic.test.mjs via new Function(),
 // so it must stay self-contained: every helper a function here calls lives in
 // this fence too. Anything that touches an agent or writes a file does NOT belong here.
+
+// parseArgs — normalize the workflow's `args` input into a plain config object,
+// no matter how it arrives. The slash command is SUPPOSED to hand us a structured
+// object ({ inputDir, target, outputDir }), but when the workflow is launched via
+// the skill/command bridge the RAW argument string is forwarded verbatim instead
+// (e.g. "go --input /src/mulch"). Before this helper that string fell through to
+// SOURCE="." / TARGET="", silently analyzing the cwd (the WRONG codebase). This is
+// the single normalization point; it accepts every shape:
+//   - object               -> returned as-is (already structured; the happy path)
+//   - JSON object string    -> parsed and used directly
+//   - CLI string            -> parsed as `<target> [input] [--input d] [--output d] [--knob v]`
+//   - undefined/null/other  -> {}
+// Pure (returns data, never logs): multi-target and other warnings are emitted by
+// the caller from the returned config.
+function parseArgs(raw) {
+  if (raw && typeof raw === 'object') return raw
+  if (typeof raw !== 'string') return {}
+  const s = raw.trim()
+  if (!s) return {}
+  // A serialized structured form (JSON object/array) — honor it verbatim.
+  if (s[0] === '{' || s[0] === '[') {
+    try { const o = JSON.parse(s); if (o && typeof o === 'object') return o } catch { /* fall through to CLI parse */ }
+  }
+  return parseCliArgs(s)
+}
+
+// parseCliArgs — parse the command's documented `<target-lang> [input-dir]
+// [--input <dir>] [--output <dir>] [--<knob> <value>]` grammar from a raw string.
+// Flags (and the --flag=value form) override the positional target/input dir, as
+// the command spec states. Recognized flag aliases collapse to the canonical cfg
+// keys (inputDir/outputDir/target); any other --flag passes through with its name
+// preserved (camelCase intact) so tuning knobs like --maxEpics still work. A bare
+// --flag with no value becomes `true`.
+function parseCliArgs(s) {
+  const alias = {
+    input: 'inputDir', inputdir: 'inputDir',
+    output: 'outputDir', outputdir: 'outputDir', out: 'outputDir', outdir: 'outputDir',
+    target: 'target',
+  }
+  const toks = s.split(/\s+/).filter(Boolean)
+  const cfg = {}
+  const positionals = []
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]
+    if (t.startsWith('--')) {
+      let name = t.slice(2)
+      let value
+      const eq = name.indexOf('=')
+      if (eq !== -1) { value = name.slice(eq + 1); name = name.slice(0, eq) }
+      else if (i + 1 < toks.length && !toks[i + 1].startsWith('--')) value = toks[++i]
+      else value = true
+      cfg[alias[name.toLowerCase()] || name] = value
+    } else {
+      positionals.push(t)
+    }
+  }
+  // Positional fallbacks: 1st = target, 2nd = input dir. A flag already set wins.
+  if (cfg.target === undefined && positionals[0] !== undefined) cfg.target = positionals[0]
+  if (cfg.inputDir === undefined && positionals[1] !== undefined) cfg.inputDir = positionals[1]
+  return cfg
+}
 
 // topoSort — deterministic Kahn topological sort over the `dependsOn` graph.
 // Input: [{ id, dependsOn? }]. `dependsOn` lists prerequisite slice ids (those
