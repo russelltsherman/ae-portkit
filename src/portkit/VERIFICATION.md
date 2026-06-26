@@ -10,7 +10,19 @@ These check the plugin is well-formed and the workflow is loadable. All currentl
 
 ```bash
 # from the marketplace repo root
-node --check src/portkit/workflows/portkit.js          # workflow parses
+
+# unit + integration tests + a full-file syntax gate. Covers three layers:
+#  - portkit.deterministic.test.mjs — unit-tests the pure helpers in the
+#    <portkit:deterministic> region (topoSort, rewriteEdges, buildEpicTree,
+#    projectAgents, planEpicBatches), extracted from the file so the shipped code
+#    IS the tested code; plus a full-file async-wrap parse gate.
+#  - portkit.run.test.mjs — RUNS the whole workflow body with a mock runtime
+#    (stub agent()/log()/phase()), validating the normal path, slice merging, and
+#    the over-scale partition + resume passes (no slice dropped) — no model calls.
+# NOTE: plain `node --check` CANNOT validate the workflow — its body has top-level
+# `return`/`await`, legal only because the runtime wraps it in an async function;
+# the parse gate mimics that wrap.
+npm test
 
 # workflow-creator linter (meta block, determinism bans, size)
 node ~/.claude/plugins/cache/ae-skills/skills/0.1.0/skills/workflow-creator/scripts/validate-workflow.mjs \
@@ -39,10 +51,11 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
    ```bash
    export CLAUDE_CODE_WORKFLOWS=1 && claude
    ```
-2. A small **source fixture with good test coverage** — one language, modest size. A ready fixture
-   ships at `src/examples/seeds-go/`: a tested Go HTTP JSON service (4 vertical capabilities,
-   `go test ./...` passing at ~99% coverage of the library package). Use a target language other than
-   `go` (e.g. `rust`, `typescript`) so the mapping layer is meaningful.
+2. A small **source fixture with good test coverage** — one language, modest size. **No fixture
+   ships in this repo yet** (`src/examples/` does not exist); Tier 2 is blocked until one is added.
+   The intended fixture is a tested Go HTTP JSON service (~4 vertical capabilities, `go test ./...`
+   passing at high coverage). Use a target language other than `go` (e.g. `rust`, `typescript`) so
+   the mapping layer is meaningful.
 
 ### Run
 

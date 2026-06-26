@@ -46,10 +46,11 @@ flags.
    - `inputDir`: the resolved input dir (`--input` flag, else positional `[input-dir]`, else `"."`).
    - `outputDir`: the `--output` value if given; otherwise omit it and let the workflow default to
      `<inputDir>/<target-language>` (`<inputDir>/.portkit` if no target).
-   - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`, `maxSlices`,
-     `maxHintsPerTarget`, `maxGapfillRounds`, and `maxConcurrency` (max agents in flight at once;
+   - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`,
+     `maxHintsPerTarget`, `maxGapfillRounds`, `maxConcurrency` (max agents in flight at once;
      defaults to `8` — lower it if the run is being API-rate-limited/throttled, raise it to go faster
-     on an account with generous limits).
+     on an account with generous limits), and `maxAgents` (the per-run agent ceiling used for the
+     over-scale guard; defaults to `1000` — the runtime's hard cap).
 
 3. **Invoke the workflow** with the `Workflow` tool, pointing `scriptPath` at the bundled script and
    passing the args object:
@@ -61,10 +62,17 @@ flags.
    ```
    The workflow runs in the background; watch it live with `/workflows`.
 
-4. **When it completes**, report the returned summary: where the docs were written (`outDir`), the
-   slice counts, any **truncations** (capped epics/slices — these are real coverage gaps, surface
-   them), and the **remaining gaps** — especially `gapsRemainingHumanDecision`, which are items a
-   human must resolve (e.g. dependencies with no clean target equivalent).
+4. **When it completes**, check `resumeRequired` first:
+   - If `resumeRequired` is `true`, the codebase was large enough that the workflow partitioned
+     slice-writing into resumable passes (no slices are dropped). It returns `resumeArgs` (e.g.
+     `{ resume: true, outputDir: "<dir>", target: "<lang>" }`). **Re-invoke the workflow with those
+     args**, and keep re-invoking until `resumeRequired` is `false`. Each pass writes the next batch
+     of slice docs against the same `outputDir`. Report progress (`slicesWritten` / `slicesRemaining`)
+     between passes.
+   - When `resumeRequired` is `false`, report the final summary: where the docs were written
+     (`outDir`), the slice counts, any **truncations** (real coverage gaps — surface them), and the
+     **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human must resolve
+     (e.g. dependencies with no clean target equivalent).
 
 ## Notes
 

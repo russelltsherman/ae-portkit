@@ -75,12 +75,23 @@ specialist agents:
 ### Tuning knobs (optional `args`)
 
 `inputDir` (default `.`), `outputDir` (default `<inputDir>/<target-language>`, or
-`<inputDir>/.portkit` if no target), `maxEpics` (40), `maxSlices` (250), `maxHintsPerTarget` (80),
-`maxGapfillRounds` (2). (`sourcePath`/`outDir` are accepted as legacy aliases for
-`inputDir`/`outputDir`.) Scale caps exist because the Workflow runtime limits a run to ~1000 agents;
-anything
-capped is **logged and recorded in the result's `truncations`** — silent truncation would read as
-"complete" when it isn't.
+`<inputDir>/.portkit` if no target), `maxEpics` (40), `maxHintsPerTarget` (80),
+`maxGapfillRounds` (2), `maxAgents` (1000, the over-scale guard's per-run ceiling), `resume`
+(internal — set automatically on a continued over-scale pass). (`sourcePath`/`outDir` are accepted as
+legacy aliases for `inputDir`/`outputDir`.) **Slices are never capped** — they are the deliverable,
+so dropping them is never an option; genuine over-scale is handled by epic-partitioned resumable
+passes (see below). The remaining caps exist because the Workflow runtime limits a run to ~1000
+agents; anything capped is **logged and recorded in the result's `truncations`** — silent truncation
+would read as "complete" when it isn't.
+
+### Over-scale: partition, never truncate
+
+If a single run's projected agent count would approach the runtime's ~1000-agent ceiling, PortKit
+runs map/discover/**synthesize once**, persists the synthesized IR under `<outputDir>/.portkit/`,
+then writes slice docs in **epic-batched passes**. The run returns `resumeRequired: true` with
+`resumeArgs`; re-invoking with those args drains the next batch against the same `outputDir` until
+every slice is written. Synthesis (and the shared kernel) is computed exactly once, so the build kit
+stays coherent across passes and **no slice is ever dropped**.
 
 ## Design constraints baked in
 
