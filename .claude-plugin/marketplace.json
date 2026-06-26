@@ -1,0 +1,15 @@
+{
+  "name": "ae-portkit",
+  "description": "Russell Sherman's portkit plugin: analyze a codebase into a target-neutral, vertical-slice build kit for porting.",
+  "owner": {
+    "name": "Russell Sherman",
+    "url": "https://github.com/russelltsherman"
+  },
+  "plugins": [
+    {
+      "name": "portkit",
+      "source": "./src/portkit",
+      "description": "Analyze a codebase into a target-neutral, vertical-slice build kit so a weaker downstream model can recreate the project in a different language or framework."
+    }
+  ]
+}
