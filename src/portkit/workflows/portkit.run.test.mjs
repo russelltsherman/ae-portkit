@@ -202,6 +202,38 @@ test('single-pass partial failure persists IR and is resumable (spend-limit mid-
   assert.equal(p2.result.counts.slicesWritten, 6)
 })
 
+test('limitSlices: opt-in test cap writes only N slices, loud partial kit, still runs target+critic', async () => {
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 4 }) // 12 slices discovered
+  const store = {}
+  const { result, rec } = await run({ ...BASE, target: 'go', limitSlices: 3 }, sc, store)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false) // a limited run is complete for its scope: one pass
+  assert.equal(result.counts.slicesPlanned, 3)
+  assert.equal(result.counts.slicesWritten, 3)
+  assert.equal(result.counts.slicesDiscovered, 12) // discovery still saw the full surface
+  assert.equal(result.counts.testLimited, true)
+  assert.equal(result.counts.slicesOmittedForTest, 9)
+  // first 3 slices in BUILD order were the ones written (prerequisites kept, deps intact)
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3])
+  // the trim is surfaced LOUDLY, never silent
+  assert.ok(result.truncations.some(t => /TEST LIMIT/.test(t)), 'test limit reported in truncations')
+  // the whole pipeline still ran end-to-end (that is the point of a cheap smoke test)
+  assert.ok(rec.labels.some(l => l.startsWith('target:')), 'target layer runs under a test cap')
+  assert.ok(rec.labels.includes('critic:1'), 'critic runs under a test cap')
+  // and it stays a normal single pass — no over-scale/resume machinery
+  assert.ok(!rec.labels.includes('ir:persist'), 'a small limited run must not partition')
+})
+
+test('limitSlices: off by default writes every slice and sets no test-limit flags', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 }) // 6 slices, no limit passed
+  const store = {}
+  const { result } = await run({ ...BASE, target: 'go' }, sc, store)
+  assert.equal(result.counts.slicesWritten, 6)
+  assert.equal(result.counts.testLimited, undefined)
+  assert.equal(result.counts.slicesOmittedForTest, undefined)
+})
+
 test('resume with no IR present fails loudly instead of silently doing nothing', async () => {
   const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
   const store = {} // no IR persisted

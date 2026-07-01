@@ -51,6 +51,12 @@ flags.
      defaults to `8` — lower it if the run is being API-rate-limited/throttled, raise it to go faster
      on an account with generous limits), and `maxAgents` (the per-run agent ceiling used for the
      over-scale guard; defaults to `1000` — the runtime's hard cap).
+   - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N slices (in
+     build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize → write →
+     target → critic) cheaply. The output is a **partial, self-consistent TEST kit** — reported
+     loudly (`counts.testLimited`, `counts.slicesOmittedForTest`, and a `🧪 TEST LIMIT` truncation)
+     and **never a complete port plan**. For the cheapest end-to-end smoke test, pair it with a low
+     `maxEpics` to also cut discovery cost, e.g. `{ maxEpics: 2, limitSlices: 3 }`.
 
 3. **Invoke the workflow** with the `Workflow` tool, pointing `scriptPath` at the bundled script and
    passing the args object:

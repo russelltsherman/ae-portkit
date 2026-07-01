@@ -242,12 +242,16 @@ test('topoSort: large chain retains every slice (no truncation)', () => {
   assert.equal(order[N - 1], `s${N - 1}`)
 })
 
-// Regression guard: the slice cap must stay removed. Slices are the deliverable;
-// re-introducing cap(allSlices, …) / a MAX_SLICES knob would silently drop them.
-test('portkit.js does not truncate the slice list', () => {
+// Regression guard: no SILENT, always-on slice truncation. Slices are the
+// deliverable; re-introducing the removed silent `MAX_SLICES` cap or a
+// `cap(allSlices, …)` would drop them from every run. The ONLY permitted trim is the
+// opt-in, off-by-default `limitSlices` DEV/TEST knob (loudly reported), so we also
+// assert it defaults to unlimited (0) rather than some nonzero production default.
+test('portkit.js does not silently truncate the slice list (limitSlices stays opt-in)', () => {
   const src = readFileSync(SRC, 'utf8')
   assert.ok(!/MAX_SLICES/.test(src), 'a MAX_SLICES cap was reintroduced')
   assert.ok(!/cap\(\s*allSlices/.test(src), 'cap(allSlices, …) truncation was reintroduced')
+  assert.ok(/Number\(cfg\.limitSlices\)\s*\|\|\s*0/.test(src), 'limitSlices must default to 0 (unlimited)')
 })
 
 // --- projectAgents -----------------------------------------------------------

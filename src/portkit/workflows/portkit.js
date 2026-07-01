@@ -65,6 +65,13 @@ const OUT = (() => {
 const MAX_EPICS = Number(cfg.maxEpics) || 40
 const MAX_HINTS_PER_TARGET = Number(cfg.maxHintsPerTarget) || 80
 const MAX_GAPFILL_ROUNDS = Number(cfg.maxGapfillRounds) || 2
+// DEV/TEST ONLY cost cap. `limitSlices=N` writes only the first N slices (in build
+// order) so a live run exercises the ENTIRE pipeline (map → discover → synthesize →
+// write → target → critic) cheaply. 0 = unlimited = the production default. This is
+// deliberately NOT the removed silent `maxSlices` cap: it is opt-in, off by default,
+// and reported LOUDLY as a partial/test kit — never presented as a complete port
+// plan. Pair with a low `maxEpics` to also cut discovery cost for a smoke test.
+const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 
 // Concurrency throttle. The runtime caps in-flight agents at min(16, cores-2),
 // but that ceiling is high enough that the per-agent model requests trip API
@@ -939,9 +946,26 @@ const topo = topoSort(rewritten.slices)
 for (const note of topo.notes) { log(`⚠️  build-order: ${note}`); dropped.push(note) }
 
 const survivorById = new Map(rewritten.slices.map(s => [s.id, s]))
-const ordered = topo.order.map((id, i) => ({ ...survivorById.get(id), n: i + 1 }))
+let ordered = topo.order.map((id, i) => ({ ...survivorById.get(id), n: i + 1 }))
 if (slices.length !== ordered.length) {
   log(`Synthesis merged ${slices.length - ordered.length} duplicate slice(s); ${ordered.length} canonical slice(s) remain.`)
+}
+
+// DEV/TEST cost cap (opt-in, LOUD). Keep only the first N slices in build order.
+// `ordered` is topologically sorted, so the first N are prerequisites and every
+// kept slice's dependencies are also kept — the trimmed kit stays internally
+// consistent (INDEX, behavioral-spec, and per-target hints below all derive from
+// the trimmed `ordered`, so nothing dangles). Applied HERE, before the index and
+// spec writers, so a limited run produces a coherent partial kit, not a complete
+// kit with missing files. Off by default (LIMIT_SLICES=0); never silent.
+let slicesOmittedForTest = 0
+if (LIMIT_SLICES > 0 && ordered.length > LIMIT_SLICES) {
+  slicesOmittedForTest = ordered.length - LIMIT_SLICES
+  const full = ordered.length
+  ordered = ordered.slice(0, LIMIT_SLICES)
+  const note = `🧪 TEST LIMIT: writing only ${ordered.length} of ${full} slice(s) (limitSlices=${LIMIT_SLICES}). ` +
+    `PARTIAL end-to-end TEST kit — NOT a complete port plan; ${slicesOmittedForTest} slice(s) intentionally omitted.`
+  log(note); dropped.push(note)
 }
 const epicTree = buildEpicTree(ordered)
 
@@ -1003,5 +1027,9 @@ if (overBudget) {
 }
 return await runWriteAndFinish({
   ordered, sysFacts, partitioned: overBudget, priorWritten: [],
-  extraCounts: { epics: epics.length, slicesDiscovered: allSlices.length },
+  extraCounts: {
+    epics: epics.length, slicesDiscovered: allSlices.length,
+    // Present ONLY on a test-limited run so the partial kit is unmistakable.
+    ...(slicesOmittedForTest > 0 ? { testLimited: true, slicesOmittedForTest } : {}),
+  },
 })
