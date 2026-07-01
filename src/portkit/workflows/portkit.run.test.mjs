@@ -70,6 +70,10 @@ function makeRuntime(sc, store) {
     if (label === 'ir:load') return store.ir || { ordered: [] }
     if (label.startsWith('slice:')) {
       const n = Number(label.split(':')[1])
+      // Simulate a failed write (transient API error / spend-limit stop). Slices in
+      // store.failNs return ok:false and are NOT recorded as written, so they stay
+      // pending — exactly what a real mid-run failure does.
+      if (store.failNs && store.failNs.has(n)) return { path: `doc-${n}.md`, ok: false, selfContained: false }
       store.written = store.written || new Set()
       store.written.add(n)
       return { path: `doc-${n}.md`, ok: true, selfContained: true }
@@ -161,6 +165,41 @@ test('over-scale: partitions into resumable passes and never drops a slice', asy
   assert.equal(last.counts.slicesWritten, 12)
   // final pass ran target/critic
   assert.ok(last.counts.gapsRemaining !== undefined)
+})
+
+test('single-pass partial failure persists IR and is resumable (spend-limit mid-run)', async () => {
+  // 2 epics x 3 slices = 6, well under budget => NOT partitioned (one-pass run).
+  // Slices 4,5,6 fail on pass 1 (as if the account hit its spend limit mid-write).
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 })
+  const store = { failNs: new Set([4, 5, 6]) }
+  const p1 = await run({ ...BASE, target: 'go' }, sc, store)
+
+  // A non-over-scale pass that only partly wrote must STILL be resumable: it reports
+  // resumeRequired and, crucially, persists the IR (the bug: it used to promise a
+  // resume with no IR on disk).
+  assert.equal(p1.result.ok, true)
+  assert.equal(p1.result.resumeRequired, true)
+  assert.equal(p1.result.counts.slicesWritten, 3)
+  assert.equal(p1.result.counts.slicesRemaining, 3)
+  assert.ok(p1.rec.labels.includes('ir:persist'), 'partial-failure single pass must persist IR')
+  assert.ok(store.ir && store.ir.ordered.length === 6, 'persisted IR carries all 6 slices')
+  assert.deepEqual([...store.ir.written].sort((a, b) => a - b), [1, 2, 3])
+  // a non-final pass must NOT run target/critic
+  assert.ok(!p1.rec.labels.some(l => l.startsWith('target:')), 'no target layer on a partial pass')
+  assert.ok(!p1.rec.labels.includes('critic:1'), 'no critic on a partial pass')
+
+  // Quota refreshed: clear the failures and resume. It must load the IR, skip
+  // map/synthesis, write only the 3 pending slices, and finish cleanly.
+  store.failNs = new Set()
+  const p2 = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(p2.result.ok, true)
+  assert.equal(p2.result.resumeRequired, false)
+  assert.ok(p2.rec.labels.includes('ir:load'), 'resume must load the IR')
+  assert.ok(!p2.rec.labels.includes('map:survey'), 'resume must not re-run map')
+  assert.ok(!p2.rec.labels.includes('synthesize'), 'resume must not re-run synthesis')
+  // THE invariant: all 6 slices written exactly once across the two passes.
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6])
+  assert.equal(p2.result.counts.slicesWritten, 6)
 })
 
 test('resume with no IR present fails loudly instead of silently doing nothing', async () => {

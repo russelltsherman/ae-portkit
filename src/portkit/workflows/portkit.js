@@ -722,19 +722,29 @@ async function runWriteAndFinish({ ordered, sysFacts, partitioned, priorWritten 
   log(`Wrote ${okThisPass.length}/${thisPass.length} slice doc(s)` +
     (partitioned ? ` — ${writtenNs.size}/${ordered.length} done, ${remaining} remaining` : ''))
 
-  if (partitioned) {
+  // Persist resumable state before returning ANY resumeRequired result — this must
+  // cover BOTH an over-scale partition (more batches to come) AND a single
+  // non-partitioned pass whose writes partially failed (a transient API error or a
+  // mid-run spend-limit stop leaves slices pending). Without persisting here, that
+  // second case returns resumeRequired:true with no IR on disk, so the promised
+  // resume finds nothing and fails loudly. A pass that writes everything persists no
+  // IR (the common, clean single-pass path is byte-for-byte unchanged).
+  if (partitioned || remaining > 0) {
     await persistIR({ ordered, sysFacts, target: TARGET, written: [...writtenNs] })
-    // Progress guard: a pass that writes nothing new but still has work left would
-    // loop forever on resume. Stop loudly instead.
-    if (okThisPass.length === 0 && remaining > 0) {
-      const err = `Over-scale resume made no progress: all ${thisPass.length} write(s) this pass failed, ${remaining} slice(s) still pending.`
-      log(`❌ ${err}`); dropped.push(err)
-      return { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped }
-    }
+  }
+
+  // Progress guard: a resume/partition pass that writes nothing new but still has
+  // work left would loop forever on resume. Stop loudly instead. (A first pass that
+  // wrote zero is intentionally left resumable — that is the spend-limit case, and
+  // the IR persisted just above lets the user resume once the limit clears.)
+  if (partitioned && okThisPass.length === 0 && remaining > 0) {
+    const err = `Over-scale resume made no progress: all ${thisPass.length} write(s) this pass failed, ${remaining} slice(s) still pending.`
+    log(`❌ ${err}`); dropped.push(err)
+    return { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped }
   }
 
   if (remaining > 0) {
-    const note = `Over-scale: ${remaining} slice(s) remain after this pass — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (no slices dropped).`
+    const note = `${remaining} slice(s) remain after this pass (writes incomplete — over-scale partition or an interrupted pass, e.g. a spend-limit stop) — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (no slices dropped).`
     log(`⏸️  ${note}`); dropped.push(note)
     return {
       ok: true, outDir: OUT, target: TARGET || null, resumeRequired: true,
