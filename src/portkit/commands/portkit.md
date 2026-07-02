@@ -58,6 +58,13 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      held back for the finishing critic pass. Precedence: a runtime `+Nk` directive (`budget.total`)
      wins over `maxTokensPerRun`; with neither set, behavior is exactly as before (no pausing). Pair
      with `/loop /portkit …` to drive a huge project to completion across many budget-sized chunks.
+   - `distill` (default `false`): after the critic validates the kit, emit a **citation-free mirror**
+     under `<output>/rebuild/` for the weaker downstream model that rebuilds from the docs. The
+     top-level docs keep their `path:line` source citations (useful to *you* for auditing grounding),
+     but those references point at source the rebuilder can't open — so the `rebuild/` copy strips
+     them while keeping `[INFERRED]`/`[UNVERIFIED]` flags and real artifact paths. Point the rebuilder
+     at `rebuild/`, keep the top level for review. Reported via `counts.distilledDocs` /
+     `counts.residualCitations` and `keyDocs.rebuildDir`.
    - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N feature specs
      (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
      adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —

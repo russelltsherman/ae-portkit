@@ -75,7 +75,8 @@ specialist agents:
 capabilities analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
 ceiling), `maxTokensPerRun` (0 = unlimited — a per-invocation token ceiling for subscription-window
 chunking, see below), `tokenReserve` (50000 — tokens held back for the finishing critic pass),
-`fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
+`distill` (false — after the critic, emit a citation-free `rebuild/` mirror for the weaker rebuilder;
+see below), `fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
 auto-resume is the normal path). (`sourcePath`/`outDir` are accepted as legacy aliases for
 `inputDir`/`outputDir`.) **Features are never capped** — they are the deliverable, so dropping them is
 never an option; genuine over-scale is handled by capability-partitioned resumable passes (see
@@ -115,6 +116,17 @@ completes **at least one unit of work** before pausing, so it can never no-progr
 window is smaller than a single phase. Token-budgeted write passes batch at **slice granularity**
 (≈`maxConcurrency` specs), so overshoot is bounded even inside one very large capability. With no
 budget set, none of this engages — behavior is byte-identical.
+
+**Distill for the rebuilder (opt-in).** Every doc is grounded with `path:line` source citations — the
+anti-hallucination receipts the generator and critic depend on, and what lets *you* audit a claim.
+But the downstream consumer is a *weaker* model that rebuilds from the docs **without the source**, so
+those references point at files it can't open — inert clutter at best, a hallucination/cargo-cult
+vector at worst. With `distill: true`, after the critic validates the kit PortKit emits a citation-free
+**mirror** under `<outputDir>/rebuild/` (ARCHITECTURE/PRD/INDEX/ACCEPTANCE + every spec + every ADR,
+internal links intact): verified `path:line` refs are stripped, while `[INFERRED]`/`[UNVERIFIED]` flags
+and real artifact paths (e.g. `.mulch/config.yaml`) are kept. Hand the rebuilder `rebuild/`; keep the
+top-level cited kit for review. Each distilled doc self-checks for leftover citations
+(`counts.residualCitations`).
 
 **Fresh & scope safety.** A `fresh` run clears the old checkpoint and **overwrites** the prior kit's
 docs/specs (no half-old/half-new "Frankenstein"); and auto-resume **refuses** a checkpoint whose

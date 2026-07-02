@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -521,6 +521,39 @@ test('budgetExhausted: zero reserve yields only when fully spent', () => {
   assert.equal(budgetExhausted(100_000, 99_999, 0), false)
   assert.equal(budgetExhausted(100_000, 100_000, 0), true)
   assert.equal(budgetExhausted(100_000, undefined, 0), false) // spent defaults to 0
+})
+
+// --- findSourceCitations (contract for the distill pass) ---
+// The single definition of "a source citation" that the distiller strips and its verify step
+// checks. Samples are drawn from real generated kit prose.
+
+test('findSourceCitations: matches backticked and bare path:line refs, with ranges and lists', () => {
+  const { findSourceCitations } = loadDeterministic()
+  assert.deepEqual(
+    findSourceCitations('`getMulchDir` (`src/utils/config.ts:191-193`) delegates to resolveWorktreeRoot.'),
+    ['`src/utils/config.ts:191-193`'])
+  assert.deepEqual(
+    findSourceCitations('normalized to a map on read, src/utils/config.ts:219-229.'),
+    ['src/utils/config.ts:219-229'])
+  assert.deepEqual(
+    findSourceCitations('the six built-in types (`src/schemas/record.ts:1-7`, `builtins.ts:12`).'),
+    ['`src/schemas/record.ts:1-7`', '`builtins.ts:12`'])
+  // comma-list of lines
+  assert.deepEqual(findSourceCitations('see `record.ts:41,43`'), ['`record.ts:41,43`'])
+})
+
+test('findSourceCitations: does NOT match artifact paths, tags, or ratios (kept in the clean kit)', () => {
+  const { findSourceCitations } = loadDeterministic()
+  assert.deepEqual(findSourceCitations('write to `.mulch/config.yaml` and `.mulch/expertise/`'), [])
+  assert.deepEqual(findSourceCitations('`[INFERRED]` the goal is to accumulate expertise.'), [])
+  assert.deepEqual(findSourceCitations('This is `[UNVERIFIED]` — no test covers it.'), [])
+  assert.deepEqual(findSourceCitations('a ratio of 10:30 and a time 09:05'), [])
+  assert.deepEqual(findSourceCitations('the src/utils/ directory holds helpers'), []) // no file:line
+})
+
+test('findSourceCitations: none in already-clean prose', () => {
+  const { findSourceCitations } = loadDeterministic()
+  assert.deepEqual(findSourceCitations('The config is a YAML map keyed by domain name. `[INFERRED]` intent.'), [])
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only

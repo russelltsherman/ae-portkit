@@ -121,6 +121,13 @@ function makeRuntime(sc, store) {
       return { path: `doc-${n}.md`, ok: true, selfContained: true }
     }
     if (label.startsWith('critic:')) return { gaps: [] }
+    if (label.startsWith('distill:')) {
+      // The real agent reads <OUT>/<rel>, writes a citation-free copy to <OUT>/rebuild/<rel>, and
+      // reports residual `path:line` count. Record the rel path so tests can assert full coverage.
+      store.distilled = store.distilled || []
+      store.distilled.push(label.slice('distill:'.length))
+      return { path: `rebuild/${label.slice('distill:'.length)}`, residualCitations: store.residualPerDoc || 0 }
+    }
     return 'ok' // index, acceptance, arch, prd, adr:write, gapfix — no schema, return ignored
   }
   const log = (m) => rec.logs.push(String(m))
@@ -593,4 +600,50 @@ test('no-budget regression: an unset budget yields never and completes in a sing
   assert.equal(result.resumeRequired, false, 'no voluntary yield without a budget')
   assert.ok(!('stoppedForBudget' in result))
   assert.equal(result.counts.slicesWritten, 6)
+})
+
+// ===========================================================================
+// Distill: citation-free rebuild/ mirror for the weaker rebuilder (opt-in)
+// ===========================================================================
+
+test('distill: opt-in emits a citation-free rebuild/ mirror of every consumer-facing doc', async () => {
+  const sc = scenario({
+    epics: ['e1', 'e2'], slicesPerEpic: 2, // 4 specs
+    decisions: [
+      { id: 'd1', title: 'Persist as JSONL', evidence: ['x.go:1'] },
+      { id: 'd2', title: 'Lock with O_EXCL', evidence: ['y.go:2'] },
+    ],
+  })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, distill: true }, sc, store)
+
+  assert.equal(result.ok, true)
+  assert.ok(rec.labels.some(l => l === 'distill:ARCHITECTURE.md'), 'ARCHITECTURE distilled')
+  // The four fixed docs + 4 specs + 2 ADRs are all mirrored.
+  for (const d of ['ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md']) {
+    assert.ok(store.distilled.includes(d), `${d} distilled`)
+  }
+  assert.equal(store.distilled.filter(p => p.startsWith('specs/')).length, 4, 'all 4 specs distilled')
+  assert.equal(store.distilled.filter(p => p.startsWith('adr/')).length, 2, 'both ADRs distilled')
+  assert.equal(result.keyDocs.rebuildDir, '/tmp/portkit-out/rebuild/')
+  assert.equal(result.counts.distilledDocs, 10, '4 fixed docs + 4 specs + 2 ADRs')
+  assert.equal(result.counts.residualCitations, 0)
+})
+
+test('distill: OFF by default — no rebuild/ mirror, no distill agents', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
+  const store = {}
+  const { result, rec } = await run({ ...BASE }, sc, store) // distill not set
+  assert.ok(!rec.labels.some(l => l.startsWith('distill:')), 'no distill agents run by default')
+  assert.equal(store.distilled, undefined)
+  assert.ok(!('rebuildDir' in result.keyDocs))
+  assert.ok(!('distilledDocs' in result.counts))
+})
+
+test('distill: residual citations are surfaced loudly, not hidden', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 1 }) // 4 fixed + 1 spec = 5 docs
+  const store = { residualPerDoc: 2 } // each distilled doc reports 2 leftover citations
+  const { result } = await run({ ...BASE, distill: true }, sc, store)
+  assert.equal(result.counts.residualCitations, 10, '2 residual × 5 docs, aggregated')
+  assert.ok(result.truncations.some(t => /residual citation/.test(t)), 'residuals flagged in truncations')
 })

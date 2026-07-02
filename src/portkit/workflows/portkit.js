@@ -10,6 +10,7 @@ export const meta = {
     { title: 'ADRs', detail: 'discover architecturally significant decisions; write one MADR-style ADR each' },
     { title: 'Write specs', detail: 'one self-contained, self-testing feature spec per unit' },
     { title: 'Critic', detail: 'grounding + completeness pass; write RISKS-AND-GAPS.md' },
+    { title: 'Distill', detail: 'opt-in: emit a citation-free rebuild/ mirror for the weaker rebuilder' },
   ],
 }
 
@@ -67,6 +68,13 @@ const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 // normally SKIP an existing non-empty output (so a resume never re-authors it); on a fresh run they
 // must OVERWRITE instead, otherwise a re-run over a prior (e.g. smaller/aborted) kit keeps the stale
 // docs and yields a Frankenstein. rewriteClause injects the right instruction into each writer.
+// DISTILL (opt-in): after the critic validates the kit, emit a CLEAN mirror under <OUT>/rebuild/
+// with the verified `path:line` source citations stripped — the receipts help the generator/critic
+// and a human auditor, but a weaker rebuilder cannot open them and is only confused (or led to
+// hallucinate) by them. `[INFERRED]`/`[UNVERIFIED]` flags and artifact paths (no line number) are
+// kept. The cited originals stay at the top level as the grounding/audit copy.
+const DISTILL = !!cfg.distill
+
 const FRESH = !!cfg.fresh
 const rewriteClause = (path) => FRESH
   ? `This is a FRESH run: if \`${path}\` already exists, OVERWRITE it with the newly generated content — do NOT preserve, keep, or early-return stale content.`
@@ -418,6 +426,23 @@ function chunk(arr, size) {
 function budgetExhausted(total, spent, reserve) {
   if (!(total > 0) || !isFinite(total)) return false // unlimited (unset/0/negative/non-finite) ⇒ never yields
   return (total - (spent || 0)) <= (reserve || 0)
+}
+
+// findSourceCitations — PURE. Return every SOURCE CITATION in `text`: a reference to the analyzed
+// source of the form `<path>.<ext>:<line>` (optionally backtick-wrapped, with an optional `-range`
+// and `,list`), e.g. `src/utils/config.ts:191-193`, `config.ts:308`, `src/cli.ts:110`. These are
+// the anti-hallucination receipts the generator/critic use — but a WEAKER rebuilder cannot open
+// them, so the distill pass strips them from the consumer-facing kit. This is the single, tested
+// definition of "a citation" that both the distiller's prompt and its verify step rely on.
+// It deliberately does NOT match:
+//   - a path with NO line number (e.g. `.mulch/config.yaml`) — a real artifact the rebuild produces
+//   - `[INFERRED]` / `[UNVERIFIED]` tags — those carry real meaning and are KEPT
+//   - bare ratios/times like `10:30` — no file extension precedes the colon
+function findSourceCitations(text) {
+  const PATH = '(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.[A-Za-z][A-Za-z0-9]{0,5}'
+  const LINES = '\\d+(?:[\\u2013-]\\d+)?(?:,\\s?\\d+(?:[\\u2013-]\\d+)?)*'
+  const re = new RegExp('`?' + PATH + ':' + LINES + '`?', 'g')
+  return String(text).match(re) || []
 }
 // </portkit:deterministic>
 
@@ -892,6 +917,60 @@ async function runCritic() {
   return gaps
 }
 
+// Distill (opt-in): emit a citation-free MIRROR of the kit under <OUT>/rebuild/ for the weaker
+// rebuilder. `docPaths` are relative to OUT (ARCHITECTURE.md, PRD.md, INDEX.md, ACCEPTANCE.md, every
+// specs/*.md and adr/*.md). Each doc is stripped by its own agent (file-to-file, so large docs never
+// round-trip through the orchestrator), then self-checks for residual `path:line` refs. Returns the
+// total residual count so the caller can flag an imperfect strip.
+const DISTILLED = {
+  type: 'object',
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: 'the rebuild/ path written' },
+    residualCitations: { type: 'number', description: 'count of `path:line` refs still present after stripping (should be 0)' },
+  },
+}
+async function runDistill(docPaths) {
+  phase('Distill')
+  log(`Distilling ${docPaths.length} doc(s) into \`${OUT}/rebuild/\` (citation-free copy for the rebuilder).`)
+  const reports = await pooled(docPaths.map((rel) => () => {
+    const src = `${OUT}/${rel}`
+    const dst = `${OUT}/rebuild/${rel}`
+    return agent(
+      `You are the PortKit DISTILL agent. Produce a CLEAN, citation-free copy of ONE kit document for a ` +
+      `LESS CAPABLE local model that will rebuild the software from the docs ALONE — it has NO access to the ` +
+      `original source, so \`path:line\` citations are noise at best and induce hallucination at worst.\n\n` +
+      `Read \`${src}\`. Write the cleaned version to \`${dst}\` (run \`mkdir -p\` on its parent dir first). Rules:\n` +
+      `1. REMOVE every SOURCE CITATION: a \`path:line\` reference to the original source — a path ending in a ` +
+      `file extension immediately followed by \`:<line>\` (optionally backtick-wrapped, with an optional ` +
+      `\`-range\` or \`,list\`), e.g. \`src/utils/config.ts:191-193\`, \`config.ts:308\`, \`src/cli.ts:110\`. ` +
+      `Remove the citation AND tidy the surrounding prose (drop now-empty parens, dangling "see"/"per"/"verified", ` +
+      `stray dashes, double spaces) so every sentence reads naturally.\n` +
+      `2. KEEP, verbatim: \`[INFERRED]\` and \`[UNVERIFIED]\` tags (they carry real meaning for the rebuilder), ` +
+      `all prose/behavior, headings, code blocks, and any path that has NO line number (e.g. \`.mulch/config.yaml\`, ` +
+      `\`.mulch/expertise/\`) — real artifacts the rebuild must produce.\n` +
+      `3. If a sentence ONLY POINTED at the source (e.g. "the logic is at \`config.ts:191\`") and stated no ` +
+      `behavior, INLINE the actual behavior by reading the source at \`${SOURCE}\` (stay grounded — do NOT invent). ` +
+      `If you cannot determine it, replace the pointer with a \`[UNVERIFIED]\` note. Never leave a dangling ` +
+      `reference and never fabricate.\n` +
+      `4. Change NOTHING else — do not summarize, reorder, or reword beyond the citation cleanup.\n\n` +
+      `After writing, grep \`${dst}\` for any remaining \`path:line\` citation and return the exact count as ` +
+      `\`residualCitations\` (0 means fully clean).`,
+      { schema: DISTILLED, phase: 'Distill', label: `distill:${rel}` }
+    )
+  }))
+  const residual = reports.filter(Boolean).reduce((n, r) => n + (Number(r.residualCitations) || 0), 0)
+  const failed = docPaths.length - reports.filter(Boolean).length
+  if (residual > 0 || failed > 0) {
+    const note = `Distill: ${residual} residual citation(s) across the rebuild/ copy` +
+      (failed ? ` and ${failed} doc(s) failed to distill` : '') + ` — the top-level cited kit is unaffected.`
+    log(`⚠️  ${note}`); dropped.push(note)
+  } else {
+    log(`Distill complete: ${docPaths.length} citation-free doc(s) under \`${OUT}/rebuild/\`.`)
+  }
+  return { docs: docPaths.length, residual, failed }
+}
+
 // IR persistence — the checkpoint mechanism. The orchestrator sandbox has no
 // filesystem, so an agent writes/reads/deletes the JSON. The checkpoint is now SMALL
 // (heavy analysis lives in generator-written side-cars, see EPICS_DIR), so a single
@@ -1049,6 +1128,19 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
   }
 
   const gaps = await runCritic()
+
+  // Distill (opt-in): after the critic has validated the CITED kit, emit a citation-free mirror for
+  // the rebuilder. Runs on the final pass only (all specs written), before the checkpoint is cleared.
+  let distill = null
+  if (DISTILL) {
+    const docPaths = [
+      'ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md',
+      ...ordered.map(s => specRelPath(s)),
+      ...adrs.map((d, i) => `adr/${pad(i + 1)}-${slug(d.title)}.md`),
+    ]
+    distill = await runDistill(docPaths)
+  }
+
   // The run is complete — remove the checkpoint so a later invocation starts fresh
   // instead of auto-resuming a finished run.
   await clearIR()
@@ -1060,6 +1152,7 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
       adrs: adrs.length,
       gapsRemaining: gaps.length,
       gapsRemainingHumanDecision: gaps.filter(g => !g.fixable).length,
+      ...(distill ? { distilledDocs: distill.docs, residualCitations: distill.residual } : {}),
       ...extraCounts,
     },
     truncations: dropped,
@@ -1070,6 +1163,7 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
       acceptance: `${OUT}/ACCEPTANCE.md`,
       adrDir: `${OUT}/adr/`,
       risks: `${OUT}/RISKS-AND-GAPS.md`,
+      ...(distill ? { rebuildDir: `${OUT}/rebuild/` } : {}),
     },
     remainingGaps: gaps,
   }
