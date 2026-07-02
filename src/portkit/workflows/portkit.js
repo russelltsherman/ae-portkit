@@ -63,6 +63,15 @@ const MAX_GAPFILL_ROUNDS = Number(cfg.maxGapfillRounds) || 2
 // recreation kit. Pair with a low `maxEpics` to also cut discovery cost for a smoke test.
 const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 
+// FRESH run: ignore any checkpoint AND regenerate the kit from scratch. The doc/spec/ADR writers
+// normally SKIP an existing non-empty output (so a resume never re-authors it); on a fresh run they
+// must OVERWRITE instead, otherwise a re-run over a prior (e.g. smaller/aborted) kit keeps the stale
+// docs and yields a Frankenstein. rewriteClause injects the right instruction into each writer.
+const FRESH = !!cfg.fresh
+const rewriteClause = (path) => FRESH
+  ? `This is a FRESH run: if \`${path}\` already exists, OVERWRITE it with the newly generated content — do NOT preserve, keep, or early-return stale content.`
+  : `FIRST: if \`${path}\` already exists and is non-empty, a prior pass wrote it — do NOT rewrite it; return immediately (its durable output stands).`
+
 // Concurrency throttle. The runtime caps in-flight agents at min(16, cores-2),
 // but that ceiling is high enough that the per-agent model requests trip API
 // rate limits on a busy account. We bound in-flight agents to a gentler limit
@@ -84,11 +93,36 @@ const CHECKPOINT_EVERY = Math.max(1, Number(cfg.checkpointEvery) || MAX_CONCURRE
 // across passes. Both knobs are tunable (tests force partitioning with a low cap).
 const AGENT_CAP = Number(cfg.maxAgents) || 1000
 const SAFE_BUDGET = Math.max(20, Math.floor(AGENT_CAP * (Number(cfg.agentSafetyFactor) || 0.8)))
+
+// Token/subscription-window guard. Separate axis from the agent-count guard above: a run
+// voluntarily YIELDS (persists checkpoint, returns resumeRequired) when its actual token spend
+// this turn nears the effective ceiling, so a very large project is processed as resumable chunks
+// that each fit within a subscription window. The effective ceiling has precedence:
+//   1. runtime `budget.total` (the user's "+Nk" directive), else
+//   2. `maxTokensPerRun` arg, else
+//   3. Infinity (unset ⇒ unlimited ⇒ byte-identical to today: no yield ever fires).
+// `tokenReserve` is left unspent for the tail (critic/gapfill) and matches the critic's 50k reserve.
+const MAX_TOKENS_PER_RUN = Math.max(0, Number(cfg.maxTokensPerRun) || 0)
+// Guard the falsy-zero trap: `Number(x) || 50_000` would turn an explicit reserve of 0 into 50_000.
+const TOKEN_RESERVE = (cfg.tokenReserve == null) ? 50_000 : Math.max(0, Number(cfg.tokenReserve) || 0)
 const IR_PATH = `${OUT}/.portkit/ir.json`
-// Fences delimit the verbatim IR JSON inside the persist agent's prompt so both
-// the real agent (writes it to a file) and tests (parse it back) can extract it.
+// The checkpoint (ir.json) holds ONLY small, low-entropy state — stage, source,
+// capability summaries, and LIGHT per-slice metadata (id/name/deps/one-line summary).
+// The bulky, high-entropy analysis (each slice's component thread + extracted
+// behavioral acceptance criteria) is NOT in the checkpoint: the discovery agents that
+// GENERATE it write it to per-capability side-car files under EPICS_DIR, and the
+// write/ACCEPTANCE agents read it back from there. This is deliberate: a model turn
+// stalls when forced to REPRODUCE a large exact blob (measured: a ~4KB checkpoint
+// persists fine, a ~200KB one hangs the request), but GENERATING content to a file
+// works (the doc writers do it). Keeping ir.json small makes persist/load reliable;
+// keeping the heavy data in generator-written side-cars keeps it off the model's
+// reproduction path entirely.
 const IR_OPEN = '<<<PORTKIT-IR-JSON>>>'
 const IR_CLOSE = '<<<END-PORTKIT-IR-JSON>>>'
+// Per-capability side-car files (heavy analysis), written by the discovery agents
+// that generate them and read by the write/ACCEPTANCE agents. Survive across a
+// resume (only clearIR, on success, removes them).
+const EPICS_DIR = `${OUT}/.portkit/epics`
 
 const dropped = [] // truncation ledger, surfaced in the final result + RISKS doc
 function cap(list, max, what) {
@@ -99,11 +133,6 @@ function cap(list, max, what) {
   dropped.push(note)
   return kept
 }
-
-function slug(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'slice'
-}
-function pad(n) { return String(n).padStart(4, '0') }
 
 // <portkit:deterministic>
 // PURE deterministic helpers — single source of truth for the build-graph spine.
@@ -118,6 +147,23 @@ function pad(n) { return String(n).padStart(4, '0') }
 // a `slice` becomes a per-FEATURE spec (specs/<n>-<name>.md) and an `epic` is a
 // CAPABILITY grouping in INDEX.md. Renaming here would churn every tested helper
 // for zero behavioral gain, so the mismatch is intentional and documented once.
+
+// slug — filesystem-safe kebab-case, TRUNCATED to 48 chars. pad — zero-pad a build
+// number to 4 digits. These live INSIDE the fence because specName() below depends on
+// them and specName is the single source of truth for a feature spec's filename.
+function slug(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'slice'
+}
+function pad(n) { return String(n).padStart(4, '0') }
+
+// specName — the EXACT basename of a feature spec file: `<NNNN>-<slug>.md`. This is
+// the SINGLE SOURCE OF TRUTH for the filename. Both sliceDocPath() (which WRITES the
+// file) and the INDEX writer's link target derive from it, so an INDEX link can never
+// disagree with the file on disk. The 48-char cap in slug() truncates the name part,
+// so a long feature name yields e.g. `0001-...-config-constan.md` — the link MUST use
+// this same truncated basename, never a re-slugified full name (that was the dangling-
+// link bug: the INDEX agent recomputed a slug without the cap).
+function specName(n, name) { return `${pad(n)}-${slug(name)}.md` }
 
 // parseArgs — normalize the workflow's `args` input into a plain config object,
 // no matter how it arrives. The slash command is SUPPOSED to hand us a structured
@@ -361,6 +407,18 @@ function chunk(arr, size) {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
 }
+
+// budgetExhausted — PURE. Decide whether the run should VOLUNTARILY YIELD now to fit a
+// token/subscription window. Takes plain numbers (NEVER the injected `budget` object — the
+// purity gate bans that token): the effective per-run token ceiling (`total`), tokens already
+// spent this turn (`spent`), and a `reserve` to leave for the tail (critic/gapfill). Returns
+// true iff a ceiling is in effect AND the remaining budget has fallen to the reserve.
+// An unlimited ceiling (total null/undefined/0/negative/non-finite) is NEVER exhausted, so with
+// no budget set every caller short-circuits and behavior is byte-identical to today.
+function budgetExhausted(total, spent, reserve) {
+  if (!(total > 0) || !isFinite(total)) return false // unlimited (unset/0/negative/non-finite) ⇒ never yields
+  return (total - (spent || 0)) <= (reserve || 0)
+}
 // </portkit:deterministic>
 
 // Bounded-concurrency fan-out. Same contract as parallel() — order-stable, never
@@ -575,26 +633,14 @@ const IR_SCHEMA = {
     sysFacts: { type: 'string' },
     fresh: {},
     epics: { type: 'array', items: {}, description: 'the mapped capability inventory' },
-    perEpic: { type: 'array', items: {}, description: 'completed per-capability discovery results' },
+    epicsDone: { type: 'array', items: { type: 'string' }, description: 'ids of capabilities whose discovery finished (slice data lives in side-cars, not here)' },
+    merges: { type: 'array', items: {}, description: 'dedup merge groups (the build order is recomputed from these + the light slices)' },
     adrs: { type: 'array', items: {}, description: 'discovered decisions (authored once)' },
     slicesDiscovered: { type: 'number' },
     slicesOmittedForTest: { type: 'number' },
+    scale: { type: 'object', description: 'the run\'s scale knobs {maxEpics, limitSlices} — resume aborts on a mismatch' },
     truncations: { type: 'array', items: { type: 'string' }, description: 'cumulative truncation/dedup ledger' },
     written: { type: 'array', items: { type: 'number' }, description: 'build numbers already written' },
-    ordered: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['id', 'name', 'epicId', 'n'],
-        properties: {
-          id: { type: 'string' }, name: { type: 'string' }, epicId: { type: 'string' },
-          n: { type: 'number' }, capability: { type: 'string' }, behaviorSummary: { type: 'string' },
-          dependsOn: { type: 'array', items: { type: 'string' } },
-          mergedFrom: { type: 'array', items: { type: 'string' } },
-          thread: { type: 'array' }, behavior: {},
-        },
-      },
-    },
   },
 }
 
@@ -652,7 +698,23 @@ log(`Preflight OK: \`${SOURCE}\` is a directory with ${probe.fileCount}${probe.f
 // ===========================================================================
 // Feature specs live flat under specs/ with global build-order numbering; the
 // capability grouping (was epics/<epic>/) lives in INDEX.md instead.
-function sliceDocPath(s) { return `${OUT}/specs/${pad(s.n)}-${slug(s.name)}.md` }
+function sliceDocPath(s) { return `${OUT}/${specRelPath(s)}` }
+// specRelPath — the spec path RELATIVE to OUT (`specs/<NNNN>-<slug>.md`). Used both to
+// build sliceDocPath (the absolute write target) and as the exact INDEX link target, so
+// the two can never diverge. Derives from specName (the single source of truth).
+function specRelPath(s) { return `specs/${specName(s.n, s.name)}` }
+
+// Per-capability side-car paths (heavy analysis kept off the checkpoint). One file
+// per capability per kind, each written by the agent that GENERATES it (discovery →
+// slices+thread; behavior → acceptance criteria) and read back by the feature-spec
+// and ACCEPTANCE writers. Keyed by slug(epicId) so the path is filesystem-safe.
+function slicesCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.slices.json` }
+function behaviorCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.behavior.json` }
+// LIGHT per-capability projection (id/name/capability/behaviorSummary/dependsOn — no
+// thread, no criteria). Small enough to reload one capability at a time on resume
+// without a large-string reproduction, so the orchestrator can rebuild its in-memory
+// slice list from artifacts instead of carrying it in the (size-capped) checkpoint.
+function lightCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.light.json` }
 
 // Reserve enough of the agent budget for the final pass's tail (critic + a little
 // overhead) so writing a full batch can never push the LAST pass over the cap.
@@ -663,23 +725,68 @@ function tailReserve() {
   return critic + 8
 }
 
+// Token-budget wrappers — the SINGLE place that reads the injected `budget` global (which the
+// pure deterministic region may not touch). They compute the effective ceiling and delegate the
+// yield decision to the pure budgetExhausted(). When neither a runtime "+Nk" directive nor
+// maxTokensPerRun is set, effectiveTokenTotal() is Infinity ⇒ tokenBudgetSet() is false and
+// shouldYieldForBudget() is always false ⇒ every budget branch is inert (byte-identical to today).
+function effectiveTokenTotal() {
+  if (typeof budget !== 'undefined' && budget && budget.total) return budget.total
+  if (MAX_TOKENS_PER_RUN > 0) return MAX_TOKENS_PER_RUN
+  return Infinity
+}
+function tokenSpent() {
+  return (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') ? budget.spent() : 0
+}
+function tokenBudgetSet() { return isFinite(effectiveTokenTotal()) }
+function shouldYieldForBudget() {
+  return budgetExhausted(effectiveTokenTotal(), tokenSpent(), TOKEN_RESERVE)
+}
+// Voluntary yield at a checkpoint boundary. The boundary's saveStage already persisted the
+// checkpoint, so this only records a LOUD ledger note and returns the SAME resume contract the
+// over-scale write partition uses, plus a stoppedForBudget marker. Auto-resume stitches the next
+// chunk. progressGuard (didWorkThisTurn) ensures we never yield before ≥1 unit of work this turn.
+let didWorkThisTurn = false
+function yieldForBudget(stage, extraCounts = {}) {
+  const note = `⏸️  Paused at token budget after stage '${stage}' — re-run (or /loop) with { resume: true } pointed at outputDir "${OUT}" to continue. Nothing dropped.`
+  log(note); dropped.push(note)
+  return {
+    ok: true, outDir: OUT, resumeRequired: true, stoppedForBudget: true, stage,
+    resumeArgs: { resume: true, outputDir: OUT },
+    counts: { ...extraCounts },
+    truncations: dropped,
+  }
+}
+// True only when a token ceiling is set, we've done ≥1 unit of work this turn, and spend has
+// reached the reserve. The progress guard prevents an infinite no-progress resume loop when the
+// ceiling is smaller than a single phase's cost.
+function budgetYieldNow() { return didWorkThisTurn && shouldYieldForBudget() }
+
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
     const ctx = {
       id: s.id, name: s.name, epicId: s.epicId, buildNumber: s.n,
-      capability: s.capability, thread: s.thread, behaviorSummary: s.behaviorSummary,
-      dependsOn: s.dependsOn || [], behavior: s.behavior,
+      capability: s.capability, behaviorSummary: s.behaviorSummary,
+      dependsOn: s.dependsOn || [],
     }
     return agent(
       `You are the PortKit FEATURE-SPEC writer. Write ONE self-contained feature spec to \`${path}\`.\n\n` +
+      `${FRESH ? rewriteClause(path) : `FIRST: if \`${path}\` already exists and is non-empty, a prior pass already wrote it — do NOT rewrite it; ` +
+      `return \`{ "path": "${path}", "ok": true, "selfContained": true }\` immediately (its durable output stands).`}\n\n` +
+      `This feature's heavy analysis is in two side-car files — READ them and pull out ONLY the entry whose ` +
+      `slice id is \`${s.id}\`:\n` +
+      `- Component thread: the slice with \`id == "${s.id}"\` in \`${slicesCarPath(s.epicId)}\` (its \`thread\`).\n` +
+      `- Acceptance criteria: the entry with \`sliceId == "${s.id}"\` in \`${behaviorCarPath(s.epicId)}\` ` +
+      `(\`acceptanceCriteria\`, \`testRefs\`, \`coverage\`). If that file or entry is missing, say coverage is ` +
+      `unknown/none — do NOT invent criteria.\n\n` +
       `It must let a LESS CAPABLE local model rebuild this feature from this spec + ARCHITECTURE.md ALONE, ` +
       `without the source. Include, in this order:\n` +
       `- Title + one-line capability.\n` +
-      `- The end-to-end behavior thread (each component with its source \`path:line\`).\n` +
+      `- The end-to-end behavior thread (each component with its source \`path:line\`, from the side-car).\n` +
       `- Interface/contract: inputs, outputs, and EXACT behavior — every error, edge case, and ordering guarantee.\n` +
       `- Prerequisite features (build order: this is #${s.n}; dependsOn ${JSON.stringify(s.dependsOn || [])}).\n` +
-      `- Acceptance criteria for THIS feature (from the behavioral spec; concrete and runnable-in-spirit).\n` +
+      `- Acceptance criteria for THIS feature (from the behavior side-car; concrete and runnable-in-spirit).\n` +
       `- Function/unit-sized build steps, each individually checkable.\n` +
       `- Shared conventions (names/types/cross-cutting rules) live in \`${OUT}/ARCHITECTURE.md\` — reference them, ` +
       `do NOT restate them, and do NOT depend on any other feature's internals.\n\n` +
@@ -707,22 +814,39 @@ async function discoverEpic(epic, sysFacts) {
     `SLICES — each an independently buildable & testable thread. For each slice give: a stable id (prefix with ` +
     `the epic id), name, the observable capability, the \`thread\` (components touched, each with a \`path:line\` ` +
     `citation), a precise behaviorSummary, and dependsOn (other slice ids it needs first).\n\n` +
+    `Then WRITE two side-car files (create parent directories first with \`mkdir -p\`):\n` +
+    `1. \`${slicesCarPath(epic.id)}\` — the FULL slices array (every field, INCLUDING each slice's \`thread\`). ` +
+    `This is the feature-spec writer's source for the component thread.\n` +
+    `2. \`${lightCarPath(epic.id)}\` — a LIGHT projection: a JSON array of ` +
+    `\`{ "id", "name", "capability", "behaviorSummary", "dependsOn" }\` for the same slices (NO thread). This lets a ` +
+    `resume rebuild the build graph cheaply.\n` +
+    `Write BOTH files — do not just return.\n\n` +
     `${GROUND_RULE}\n\nReturn the slices.`,
     { schema: SLICES, phase: 'Discover slices', label: `discover:${epic.id}` }
   )
   const prev = r ? { epicId: epic.id, slices: r.slices || [] } : null
   if (!prev || prev.slices.length === 0) return prev
   const ids = prev.slices.map(s => ({ id: s.id, name: s.name, capability: s.capability }))
-  const b = await agent(
+  await agent(
     `You are the PortKit BEHAVIOR-SPEC agent. The source's existing tests are the behavioral contract.\n\n` +
     `Source root: \`${SOURCE}\`. Test setup: ${sysFacts}\n\n` +
     `For each slice below, find the source tests that exercise it and translate them into LANGUAGE-NEUTRAL ` +
     `acceptance criteria (concrete enough that a weak model can self-check its rebuild). Cite each source test ` +
     `as \`path:line\`. Rate coverage good/thin/none. FLAG thin/none LOUDLY — never paper over missing coverage.\n\n` +
+    `WRITE the result as JSON \`{ "perSlice": [ { "sliceId", "coverage", "acceptanceCriteria": [...], "testRefs": [...] } ] }\` ` +
+    `to \`${behaviorCarPath(epic.id)}\` (create parent directories first). This side-car is read later by the ` +
+    `ACCEPTANCE and feature-spec writers — write the file, do not just return.\n\n` +
     `SLICES:\n${JSON.stringify(ids, null, 2)}\n\n${GROUND_RULE}\n\nReturn perSlice behavioral specs.`,
     { schema: BEHAVIOR, phase: 'Discover slices', label: `behavior:${epic.id}` }
   )
-  return { ...prev, behavior: (b && b.perSlice) || [] }
+  // LIGHT per-epic result ONLY — the bulky thread + acceptance criteria live in the
+  // side-cars written above, never in the checkpoint (that is what kept persist small
+  // enough to succeed). Downstream heavy consumers read the side-cars from disk.
+  const lightSlices = prev.slices.map((s) => ({
+    id: s.id, name: s.name, capability: s.capability,
+    behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [],
+  }))
+  return { epicId: epic.id, slices: lightSlices }
 }
 
 async function runCritic() {
@@ -746,7 +870,7 @@ async function runCritic() {
   while (
     gaps.some(g => g.fixable) &&
     round < MAX_GAPFILL_ROUNDS &&
-    (!budget.total || budget.remaining() > 50_000)
+    !shouldYieldForBudget() // stop gap-fill once remaining budget falls to the reserve (single source of truth)
   ) {
     round++
     const fixable = gaps.filter(g => g.fixable)
@@ -769,10 +893,10 @@ async function runCritic() {
 }
 
 // IR persistence — the checkpoint mechanism. The orchestrator sandbox has no
-// filesystem, so an agent writes/reads/deletes the JSON. The persist agent writes
-// the fenced bytes verbatim; the load agent returns the parsed object; the clear
-// agent deletes the file on successful completion (so a later run starts fresh
-// rather than auto-resuming a finished run).
+// filesystem, so an agent writes/reads/deletes the JSON. The checkpoint is now SMALL
+// (heavy analysis lives in generator-written side-cars, see EPICS_DIR), so a single
+// agent can write it verbatim / read it back structured without stalling — the thing
+// that broke when the full accumulator went through here (see the EPICS_DIR note).
 async function persistIR(ir) {
   await agent(
     `You are the PortKit IR-PERSIST agent. Create the directory if needed and write the JSON between the fences ` +
@@ -791,11 +915,35 @@ async function loadIR() {
 }
 async function clearIR() {
   await agent(
-    `You are the PortKit IR-CLEAR agent. Delete the file at \`${IR_PATH}\` if it exists (e.g. \`rm -f "${IR_PATH}"\`). ` +
-    `The run is complete, so this checkpoint is no longer needed and its presence would auto-resume a finished run. ` +
-    `Return when done.`,
+    `You are the PortKit IR-CLEAR agent. The run is complete, so remove the whole checkpoint directory (the ` +
+    `checkpoint JSON AND the per-capability side-cars) so a later run starts fresh instead of auto-resuming a ` +
+    `finished run: \`rm -rf "$(dirname "${IR_PATH}")"\`. Return when done.`,
     { phase: 'Checkpoint', label: 'ir:clear' }
   )
+}
+// Resume helpers — completion is judged by the DURABLE ARTIFACTS on disk, not by the
+// checkpoint, so no already-finished agent is ever re-run even if the checkpoint lagged.
+// listDoneEpics: which capabilities already have BOTH their light + behavior side-cars
+// (i.e. discovery finished for them). loadEpicLight: rebuild ONE capability's light
+// slice list from its small light.json (a small read, never the heavy slices.json).
+async function listDoneEpics() {
+  const r = await agent(
+    `You are the PortKit RESUME-SCAN agent. List \`${EPICS_DIR}\` (it may not exist — then return \`{"epicIds": []}\`). ` +
+    `A capability is DONE only if BOTH \`<id>.light.json\` AND \`<id>.behavior.json\` are present. Return ` +
+    `\`{"epicIds": [<id> for each done capability]}\` — the id is the file name with the \`.light.json\` suffix removed.`,
+    { schema: { type: 'object', properties: { epicIds: { type: 'array', items: { type: 'string' } } } },
+      phase: 'Discover slices', label: 'resume:scan' }
+  )
+  return (r && Array.isArray(r.epicIds)) ? r.epicIds : []
+}
+async function loadEpicLight(epicId) {
+  const r = await agent(
+    `You are the PortKit LIGHT-LOAD agent. Read \`${lightCarPath(epicId)}\` and return \`{"slices": <its JSON array>}\` ` +
+    `EXACTLY (do not alter). If the file is missing or empty, return \`{"slices": []}\`.`,
+    { schema: { type: 'object', properties: { slices: { type: 'array', items: {} } } },
+      phase: 'Discover slices', label: `light:${epicId}` }
+  )
+  return { epicId, slices: (r && Array.isArray(r.slices)) ? r.slices : [] }
 }
 
 // The single mutable checkpoint object. saveStage() merges a phase's output into it,
@@ -821,55 +969,83 @@ async function saveStage(stage, patch = {}) {
 async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten = [], extraCounts = {} }) {
   phase('Write specs')
   const writtenNs = new Set(priorWritten)
-  const pending = ordered.filter(s => !writtenNs.has(s.n))
 
-  let thisPass = pending
-  if (partitioned) {
-    const writeBudget = Math.max(1, SAFE_BUDGET - tailReserve())
-    const batch = planEpicBatches(buildEpicTree(pending), writeBudget)[0]
-    const ids = new Set((batch && batch.sliceIds) || [])
-    thisPass = pending.filter(s => ids.has(s.id))
-  }
+  // Per-batch size. Agent over-scale sizes a batch to the agent write budget (one big batch per
+  // invocation, as before). A TOKEN budget instead uses small FIXED batches (≤ maxConcurrency) so
+  // we checkpoint + re-check spend frequently and overshoot the window by at most one batch.
+  const agentWriteBudget = Math.max(1, SAFE_BUDGET - tailReserve())
+  const perBatch = tokenBudgetSet() ? Math.min(agentWriteBudget, MAX_CONCURRENCY) : agentWriteBudget
 
-  const docs = await writeSliceDocs(thisPass)
-  // Mark only features that actually wrote OK as done; failures stay pending and are
-  // retried on the next pass (so a flaky write is never silently lost).
-  const okThisPass = thisPass.filter((s, i) => docs[i] && docs[i].ok)
-  okThisPass.forEach(s => writtenNs.add(s.n))
-  const remaining = ordered.filter(s => !writtenNs.has(s.n)).length
-  log(`Wrote ${okThisPass.length}/${thisPass.length} feature spec(s)` +
-    (partitioned ? ` — ${writtenNs.size}/${ordered.length} done, ${remaining} remaining` : ''))
+  // Loop batches WITHIN this invocation:
+  //   - not partitioned  → one pass writes ALL pending (unchanged); partial failure yields to resume.
+  //   - agent over-scale → exactly ONE batch per invocation, then yield (unchanged).
+  //   - token-budgeted   → keep writing small batches until spend nears the reserve (or the agent
+  //                        write budget for this invocation is filled), then yield. Each batch is a
+  //                        real unit of forward progress, so the write phase can never no-progress-yield.
+  let wroteThisInvocation = 0
+  while (true) {
+    const pending = ordered.filter(s => !writtenNs.has(s.n))
+    if (pending.length === 0) break // everything written → fall through to critic
 
-  // Persist write progress before returning ANY resumeRequired result — this must
-  // cover BOTH an over-scale partition (more batches to come) AND a single
-  // non-partitioned pass whose writes partially failed (a transient API error or a
-  // mid-run spend-limit stop leaves features pending). The checkpoint already holds
-  // ordered/adrs (saved at earlier stages); here we just advance `written`. On a
-  // clean single pass that writes everything we skip this and clear the checkpoint
-  // at the end instead.
-  if (partitioned || remaining > 0) {
-    await saveStage('writing', { written: [...writtenNs] })
-  }
-
-  // Progress guard: a resume/partition pass that writes nothing new but still has
-  // work left would loop forever on resume. Stop loudly instead. (A first pass that
-  // wrote zero is intentionally left resumable — that is the spend-limit case, and
-  // the IR persisted just above lets the user resume once the limit clears.)
-  if (partitioned && okThisPass.length === 0 && remaining > 0) {
-    const err = `Over-scale resume made no progress: all ${thisPass.length} write(s) this pass failed, ${remaining} feature(s) still pending.`
-    log(`❌ ${err}`); dropped.push(err)
-    return { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped }
-  }
-
-  if (remaining > 0) {
-    const note = `${remaining} feature spec(s) remain after this pass (writes incomplete — over-scale partition or an interrupted pass, e.g. a spend-limit stop) — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (nothing dropped).`
-    log(`⏸️  ${note}`); dropped.push(note)
-    return {
-      ok: true, outDir: OUT, resumeRequired: true,
-      resumeArgs: { resume: true, outputDir: OUT },
-      counts: { slicesPlanned: ordered.length, slicesWritten: writtenNs.size, slicesRemaining: remaining, ...extraCounts },
-      truncations: dropped,
+    let thisPass = pending
+    if (partitioned && tokenBudgetSet()) {
+      // Token chunking: take the next `perBatch` specs in build order. Specs are independent
+      // files, so we batch at SLICE granularity here (not epic) — this bounds the per-pass
+      // overshoot to ~maxConcurrency specs even inside one very large capability. Build order is
+      // preserved (pending is ordered), so prerequisites still precede dependents.
+      thisPass = pending.slice(0, perBatch)
+    } else if (partitioned) {
+      // Agent over-scale (no token budget): keep whole capabilities together per pass.
+      const batch = planEpicBatches(buildEpicTree(pending), perBatch)[0]
+      const ids = new Set((batch && batch.sliceIds) || [])
+      thisPass = pending.filter(s => ids.has(s.id))
     }
+
+    const docs = await writeSliceDocs(thisPass)
+    // Mark only features that actually wrote OK as done; failures stay pending and are
+    // retried on the next pass (so a flaky write is never silently lost).
+    const okThisPass = thisPass.filter((s, i) => docs[i] && docs[i].ok)
+    okThisPass.forEach(s => writtenNs.add(s.n))
+    if (okThisPass.length) didWorkThisTurn = true
+    wroteThisInvocation += okThisPass.length
+    const remaining = ordered.filter(s => !writtenNs.has(s.n)).length
+    log(`Wrote ${okThisPass.length}/${thisPass.length} feature spec(s)` +
+      (partitioned ? ` — ${writtenNs.size}/${ordered.length} done, ${remaining} remaining` : ''))
+
+    // Persist write progress before returning ANY resumeRequired result (over-scale partition,
+    // token yield, or a partially-failed non-partitioned pass). A clean full pass skips this and
+    // clears the checkpoint at the end instead.
+    if (partitioned || remaining > 0) {
+      await saveStage('writing', { written: [...writtenNs] })
+    }
+
+    // No-progress guard: a partitioned batch that wrote nothing but has work left would loop
+    // forever (across resumes AND within this while-loop). Stop loudly.
+    if (partitioned && okThisPass.length === 0 && remaining > 0) {
+      const err = `Write pass made no progress: all ${thisPass.length} write(s) failed, ${remaining} feature(s) still pending${tokenBudgetSet() ? ' (token-budget chunked run)' : ''}.`
+      log(`❌ ${err}`); dropped.push(err)
+      return { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped }
+    }
+
+    if (remaining === 0) break // all done this pass → critic
+
+    // Decide: keep filling this invocation, or yield to resume?
+    //   - token-budgeted: continue unless spend hit the reserve OR the agent write budget is filled.
+    //   - otherwise (not partitioned partial-failure, or agent over-scale): one pass per invocation.
+    const stopForBudget = tokenBudgetSet() && shouldYieldForBudget()
+    const stopForAgentCap = wroteThisInvocation >= agentWriteBudget
+    if (!tokenBudgetSet() || stopForBudget || stopForAgentCap) {
+      const note = `${remaining} feature spec(s) remain after this ${stopForBudget ? 'token-budget ' : ''}pass — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (nothing dropped).`
+      log(`⏸️  ${note}`); dropped.push(note)
+      return {
+        ok: true, outDir: OUT, resumeRequired: true,
+        ...(stopForBudget ? { stoppedForBudget: true, stage: 'writing' } : {}),
+        resumeArgs: { resume: true, outputDir: OUT },
+        counts: { slicesPlanned: ordered.length, slicesWritten: writtenNs.size, slicesRemaining: remaining, ...extraCounts },
+        truncations: dropped,
+      }
+    }
+    // token budget remains → loop to the next small batch within THIS invocation
   }
 
   const gaps = await runCritic()
@@ -915,12 +1091,32 @@ if (!cfg.fresh) {
   if (loaded && loaded.stage) {
     if (loaded.source && loaded.source !== SOURCE) {
       log(`⚠️  Ignoring checkpoint at \`${IR_PATH}\`: it belongs to a different source (\`${loaded.source}\` ≠ \`${SOURCE}\`). Starting fresh — use --output for a separate dir to keep both.`)
+    } else if (loaded.scale &&
+      ((loaded.scale.maxEpics ?? MAX_EPICS) !== MAX_EPICS || (loaded.scale.limitSlices ?? LIMIT_SLICES) !== LIMIT_SLICES)) {
+      // Scope MISMATCH: the checkpoint was built with different scale knobs. Resuming would reuse
+      // the checkpoint's (capped) epic list and limitSlices, silently continuing the smaller scope
+      // with this run's flags. Abort loudly rather than produce a Frankenstein kit.
+      return {
+        ok: false,
+        error: `Checkpoint at \`${IR_PATH}\` was built with maxEpics=${loaded.scale.maxEpics}, limitSlices=${loaded.scale.limitSlices}; ` +
+          `this run uses maxEpics=${MAX_EPICS}, limitSlices=${LIMIT_SLICES}. Resuming would keep the checkpoint's smaller scope, ` +
+          `not your new flags. Use { fresh: true } with a clean or new outputDir for a full run, or re-run with the same scale knobs to continue this checkpoint.`,
+        outDir: OUT,
+        checkpointScale: loaded.scale,
+        requestedScale: { maxEpics: MAX_EPICS, limitSlices: LIMIT_SLICES },
+      }
     } else {
       checkpoint = loaded
       dropped.push(...(Array.isArray(loaded.truncations) ? loaded.truncations : []))
       log(`↩️  Resuming from checkpoint stage '${loaded.stage}' for \`${SOURCE}\`.`)
     }
   }
+} else {
+  // FRESH: drop any stale checkpoint + side-cars so discovery re-runs cleanly, and warn that
+  // existing generated docs will be OVERWRITTEN (the writers get rewriteClause). Orphaned
+  // higher-numbered specs from a LARGER prior run may remain — a clean/new outputDir avoids that.
+  await clearIR()
+  log(`🧹 Fresh run: cleared any checkpoint under \`${OUT}/.portkit\`; existing kit files in \`${OUT}\` will be OVERWRITTEN (orphaned specs from a larger prior run may remain — use a clean or new outputDir if that matters).`)
 }
 if (cfg.resume && !checkpoint) {
   return {
@@ -972,7 +1168,13 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
   }, null, 2)
   epics = cap(map.epics, MAX_EPICS, 'epics')
   log(`Mapped ${map.epics.length} capability(ies); analyzing ${epics.length}.`)
-  await saveStage('mapped', { source: SOURCE, fileCount: probe.fileCount, sysFacts, epics })
+  // Persist the scale knobs so a later resume can detect a scope MISMATCH (e.g. resuming a
+  // maxEpics=5/limitSlices=3 smoke-test checkpoint with a full-run command) and refuse to silently
+  // continue the smaller scope — the exact trap that produced the 5-epic Frankenstein kit.
+  await saveStage('mapped', {
+    source: SOURCE, fileCount: probe.fileCount, sysFacts, epics,
+    scale: { maxEpics: MAX_EPICS, limitSlices: LIMIT_SLICES },
+  })
 }
 
 // ===========================================================================
@@ -981,7 +1183,20 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
 // each batch the checkpoint advances, so an interruption keeps every already-analyzed
 // capability instead of restarting the whole (most expensive) discovery phase.
 // ===========================================================================
-let perEpicDone = (RESUMING && Array.isArray(checkpoint.perEpic)) ? checkpoint.perEpic : []
+// perEpicDone holds LIGHT slices in memory (fresh: from discovery returns; resume:
+// rebuilt from the light side-cars). On resume, completion is judged by the durable
+// side-cars — NOT the checkpoint — so no finished capability is ever re-analyzed. We
+// rebuild in `epics` order (not filesystem order) so the downstream build numbering is
+// identical to a fresh run, keeping already-written spec file names valid.
+let perEpicDone = []
+if (RESUMING && stageDone(savedStage, 'mapped')) {
+  const doneSet = new Set(await listDoneEpics())
+  const doneInOrder = epics.filter(e => doneSet.has(e.id)).map(e => e.id)
+  if (doneInOrder.length) {
+    perEpicDone = (await pooled(doneInOrder.map(id => () => loadEpicLight(id)))).filter(Boolean)
+    log(`Reusing ${perEpicDone.length} capability(ies) already analyzed by a prior run (from side-cars).`)
+  }
+}
 if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
   phase('Discover slices')
   const doneIds = new Set(perEpicDone.map(e => e && e.epicId))
@@ -990,9 +1205,17 @@ if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
   for (const group of chunk(todo, CHECKPOINT_EVERY)) {
     const results = await pooled(group.map((epic) => () => discoverEpic(epic, sysFacts)))
     perEpicDone.push(...results.filter(Boolean))
-    await saveStage('discovering', { perEpic: perEpicDone })
+    didWorkThisTurn = true // a discovery batch completed this turn — the progress guard is now armed
+    // TINY checkpoint: advance the stage + record only WHICH capabilities are done
+    // (their ids). The slice data itself lives in the durable side-cars, never here.
+    await saveStage('discovering', { epicsDone: perEpicDone.map(e => e.epicId) })
+    // Voluntary token-budget yield: discovery is the dominant early cost and is fully
+    // mid-phase resumable (side-cars + epicsDone), so this is the cheapest place to chunk a
+    // very large project. The just-checkpointed batch is durable before we stop.
+    if (budgetYieldNow()) return yieldForBudget('discovering', { epicsDiscovered: perEpicDone.length })
   }
-  await saveStage('discovered', { perEpic: perEpicDone })
+  await saveStage('discovered', { epicsDone: perEpicDone.map(e => e.epicId) })
+  if (budgetYieldNow()) return yieldForBudget('discovered', { epicsDiscovered: perEpicDone.length })
 }
 
 // ===========================================================================
@@ -1001,84 +1224,93 @@ if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
 // a resume past this stage (the ordered build graph is reloaded from the checkpoint,
 // so build numbers stay stable — specs already written keep matching their numbers).
 // ===========================================================================
+// `ordered` (the numbered build graph) is NOT persisted — it is an O(slices) aggregate
+// that would blow the checkpoint's size budget. Instead we persist only the small
+// DEDUP `merges` and recompute the build order deterministically (rewriteEdges +
+// topoSort, both unit-tested) from the light slices. Same slices + same merges ⇒ same
+// numbering, so specs already written on a prior pass keep matching their build numbers.
 let ordered, slicesDiscovered, slicesOmittedForTest = 0
-if (RESUMING && stageDone(savedStage, 'synthesized')) {
-  ordered = checkpoint.ordered || []
-  slicesDiscovered = checkpoint.slicesDiscovered || ordered.length
-  slicesOmittedForTest = checkpoint.slicesOmittedForTest || 0
-  log(`Skipping synthesis (checkpointed): ${ordered.length} feature(s) in build order.`)
-} else {
-  // Flatten completed discovery into a single slice list, attaching behavior + epic.
-  const allSlices = []
+{
+  // Flatten light slices (fresh: from discovery returns; resume: rebuilt from side-cars).
+  // Heavy thread/behavior stay in side-cars, read from disk by the spec/ACCEPTANCE writers.
+  const slices = []
   for (const e of perEpicDone) {
     if (!e) continue
-    const behaviorById = new Map((e.behavior || []).map(b => [b.sliceId, b]))
-    for (const s of (e.slices || [])) {
-      allSlices.push({ ...s, epicId: e.epicId, behavior: behaviorById.get(s.id) || null })
-    }
+    for (const s of (e.slices || [])) slices.push({ ...s, epicId: e.epicId })
   }
-  if (allSlices.length === 0) {
+  if (slices.length === 0) {
     return { ok: false, error: 'No vertical slices were discovered.', outDir: OUT }
   }
-  // Every discovered slice is carried — NEVER truncated (see the scale-guard note).
-  const slices = allSlices
-  slicesDiscovered = allSlices.length
-  log(`Discovered ${slices.length} feature(s) across ${perEpicDone.filter(Boolean).length} capability(ies).`)
-  phase('Synthesize')
-  const synthInput = slices.map(s => ({
-  id: s.id, name: s.name, epicId: s.epicId, capability: s.capability,
-  behaviorSummary: s.behaviorSummary,
-}))
-const synth = await agent(
-  `You are the PortKit SYNTHESIS agent. You receive ALL discovered vertical slices (features) in compact form.\n\n` +
-  `Do ONE thing — DEDUP: identify sets of slices that are truly the SAME vertical thread discovered from different ` +
-  `capabilities/angles. For each set return a merge group { keep, merge: [ids…] } — \`keep\` is the surviving ` +
-  `canonical slice id, \`merge\` lists the OTHER ids folded into it. Only merge GENUINE duplicates; when in doubt ` +
-  `do NOT merge (a wrongly-merged slice silently loses real behavior). Return an empty list if nothing merges. Do ` +
-  `NOT compute a build order and do NOT renumber — ordering is handled deterministically downstream.\n\n` +
-  `Source facts: ${sysFacts}\n\nSLICES:\n${JSON.stringify(synthInput, null, 2)}\n\n` +
-  `${GROUND_RULE}\n\nReturn the merge groups.`,
-  { schema: SYNTH, phase: 'Synthesize', label: 'synthesize' }
-)
+  slicesDiscovered = slices.length
 
-// Apply the agent's MERGE DECISIONS deterministically. Build a merge map (folded
-// id -> surviving id), then let JS do every mechanical graph step: rewriteEdges
-// remaps/aggregates dependsOn across merges (dropping self/parallel edges, never
-// dropping a slice), and topoSort computes the build order (recovering cycles/
-// dangling deps into the ledger). The agent never touches the build graph.
-const mergeMap = {}
-for (const m of ((synth && synth.merges) || [])) {
-  const keep = m && m.keep
-  if (!keep) continue
-  for (const f of (m.merge || [])) if (f && f !== keep) mergeMap[f] = keep
-}
-const rewritten = rewriteEdges(slices, mergeMap)
-for (const note of rewritten.notes) { log(`🔀 dedup: ${note}`); dropped.push(note) }
-const topo = topoSort(rewritten.slices)
-for (const note of topo.notes) { log(`⚠️  build-order: ${note}`); dropped.push(note) }
+  // Dedup decisions: reuse the persisted merges on a resume past 'synthesized' (the
+  // synth agent never re-runs); otherwise ask the synth agent for them now.
+  const resumedSynth = RESUMING && stageDone(savedStage, 'synthesized') && Array.isArray(checkpoint.merges)
+  let merges
+  if (resumedSynth) {
+    merges = checkpoint.merges
+    log(`Skipping synthesis (checkpointed merges): rebuilding build order for ${slices.length} slice(s).`)
+  } else {
+    log(`Discovered ${slices.length} feature(s) across ${perEpicDone.filter(Boolean).length} capability(ies).`)
+    phase('Synthesize')
+    const synthInput = slices.map(s => ({
+      id: s.id, name: s.name, epicId: s.epicId, capability: s.capability, behaviorSummary: s.behaviorSummary,
+    }))
+    const synth = await agent(
+      `You are the PortKit SYNTHESIS agent. You receive ALL discovered vertical slices (features) in compact form.\n\n` +
+      `Do ONE thing — DEDUP: identify sets of slices that are truly the SAME vertical thread discovered from different ` +
+      `capabilities/angles. For each set return a merge group { keep, merge: [ids…] } — \`keep\` is the surviving ` +
+      `canonical slice id, \`merge\` lists the OTHER ids folded into it. Only merge GENUINE duplicates; when in doubt ` +
+      `do NOT merge (a wrongly-merged slice silently loses real behavior). Return an empty list if nothing merges. Do ` +
+      `NOT compute a build order and do NOT renumber — ordering is handled deterministically downstream.\n\n` +
+      `Source facts: ${sysFacts}\n\nSLICES:\n${JSON.stringify(synthInput, null, 2)}\n\n` +
+      `${GROUND_RULE}\n\nReturn the merge groups.`,
+      { schema: SYNTH, phase: 'Synthesize', label: 'synthesize' }
+    )
+    merges = (synth && synth.merges) || []
+  }
 
-const survivorById = new Map(rewritten.slices.map(s => [s.id, s]))
-ordered = topo.order.map((id, i) => ({ ...survivorById.get(id), n: i + 1 }))
-if (slices.length !== ordered.length) {
-  log(`Synthesis merged ${slices.length - ordered.length} duplicate slice(s); ${ordered.length} canonical slice(s) remain.`)
-}
+  // Apply the MERGE DECISIONS deterministically — JS owns every mechanical graph step:
+  // rewriteEdges remaps/aggregates dependsOn across merges (never dropping a slice),
+  // topoSort computes the build order (recovering cycles/dangling deps into the ledger).
+  const mergeMap = {}
+  for (const m of merges) {
+    const keep = m && m.keep
+    if (!keep) continue
+    for (const f of (m.merge || [])) if (f && f !== keep) mergeMap[f] = keep
+  }
+  const rewritten = rewriteEdges(slices, mergeMap)
+  const topo = topoSort(rewritten.slices)
+  const survivorById = new Map(rewritten.slices.map(s => [s.id, s]))
+  const orderedFull = topo.order.map((id, i) => ({ ...survivorById.get(id), n: i + 1 }))
+  const mergedCount = slices.length - orderedFull.length
+  ordered = orderedFull
 
-// DEV/TEST cost cap (opt-in, LOUD). Keep only the first N features in build order.
-// `ordered` is topologically sorted, so the first N are prerequisites and every
-// kept feature's dependencies are also kept — the trimmed kit stays internally
-// consistent (INDEX, ACCEPTANCE, and the feature specs below all derive from the
-// trimmed `ordered`, so nothing dangles). Applied HERE, before the doc writers, so
-// a limited run produces a coherent partial kit, not a complete kit with missing
-// files. Off by default (LIMIT_SLICES=0); never silent.
-if (LIMIT_SLICES > 0 && ordered.length > LIMIT_SLICES) {
-  slicesOmittedForTest = ordered.length - LIMIT_SLICES
-  const full = ordered.length
-  ordered = ordered.slice(0, LIMIT_SLICES)
-  const note = `🧪 TEST LIMIT: writing only ${ordered.length} of ${full} feature(s) (limitSlices=${LIMIT_SLICES}). ` +
-    `PARTIAL end-to-end TEST kit — NOT a complete recreation kit; ${slicesOmittedForTest} feature(s) intentionally omitted.`
-  log(note); dropped.push(note)
-}
-  await saveStage('synthesized', { ordered, sysFacts, slicesDiscovered, slicesOmittedForTest })
+  // DEV/TEST cost cap (opt-in, LOUD). Keep only the first N features in build order;
+  // topo order means prerequisites are kept, so the trimmed kit stays consistent.
+  if (LIMIT_SLICES > 0 && ordered.length > LIMIT_SLICES) {
+    slicesOmittedForTest = ordered.length - LIMIT_SLICES
+    ordered = ordered.slice(0, LIMIT_SLICES)
+  }
+
+  // Ledger notes + checkpoint only on the FRESH synth path (recomputing on resume
+  // would duplicate the notes and the merges are already persisted).
+  if (!resumedSynth) {
+    for (const note of rewritten.notes) { log(`🔀 dedup: ${note}`); dropped.push(note) }
+    for (const note of topo.notes) { log(`⚠️  build-order: ${note}`); dropped.push(note) }
+    if (mergedCount > 0) log(`Synthesis merged ${mergedCount} duplicate slice(s); ${orderedFull.length} canonical slice(s) remain.`)
+    if (slicesOmittedForTest > 0) {
+      const note = `🧪 TEST LIMIT: writing only ${ordered.length} of ${orderedFull.length} feature(s) (limitSlices=${LIMIT_SLICES}). ` +
+        `PARTIAL end-to-end TEST kit — NOT a complete recreation kit; ${slicesOmittedForTest} feature(s) intentionally omitted.`
+      log(note); dropped.push(note)
+    }
+    await saveStage('synthesized', { merges, sysFacts, slicesDiscovered, slicesOmittedForTest })
+    didWorkThisTurn = true // the synth agent ran this turn
+  }
+  // Yield only if something ran this turn (fresh synth here, or discovery earlier). On a pure
+  // resume that reloaded merges without doing work, didWorkThisTurn stays false so we push on to
+  // the doc family rather than yield having done nothing.
+  if (budgetYieldNow()) return yieldForBudget('synthesized', { slicesDiscovered })
 }
 
 // ===========================================================================
@@ -1101,20 +1333,37 @@ if (RESUMING && stageDone(savedStage, 'docs')) {
 // INDEX writer — transcribes the JS-computed build order + capability tree into
 // INDEX.md (the orchestrator sandbox cannot write files; an agent must). The data
 // is AUTHORITATIVE: the agent must not reorder or invent.
+//
+// Each feature carries its EXACT `spec` path (specRelPath → specName, the same source
+// of truth sliceDocPath uses to WRITE the file). The agent MUST link that verbatim and
+// MUST NOT re-slugify the name: slug() truncates to 48 chars, so a recomputed link for a
+// long name silently disagreed with the truncated file on disk — every such link 404'd
+// even on a fully successful run. The capability tree is enriched with the same per-
+// feature {n,id,name,spec} so its links use the exact path too (not just build order).
+const byIdForIndex = new Map(ordered.map(s => [s.id, s]))
 const indexData = {
   buildOrder: ordered.map(s => ({
-    n: s.n, id: s.id, name: s.name, epicId: s.epicId,
+    n: s.n, id: s.id, name: s.name, epicId: s.epicId, spec: specRelPath(s),
     dependsOn: s.dependsOn || [], mergedFrom: s.mergedFrom || [],
   })),
-  capabilityTree: epicTree,
+  capabilityTree: epicTree.map(({ epicId, sliceIds }) => ({
+    epicId,
+    features: sliceIds.map(id => {
+      const s = byIdForIndex.get(id)
+      return { n: s.n, id: s.id, name: s.name, spec: specRelPath(s) }
+    }),
+  })),
 }
 await agent(
-  `You are the PortKit INDEX writer. Write \`${OUT}/INDEX.md\` — the recreation roadmap — from the data below. ` +
+  `You are the PortKit INDEX writer. ${rewriteClause(`${OUT}/INDEX.md`)} Write \`${OUT}/INDEX.md\` — the recreation roadmap — from the data below. ` +
   `The build order and capability→feature tree are AUTHORITATIVE (computed deterministically) — do NOT reorder, ` +
   `renumber, or invent.\n\n` +
+  `CRITICAL — spec links: every feature object carries an exact \`spec\` field (e.g. \`specs/0001-....md\`). Use that ` +
+  `string VERBATIM as the markdown link target. Do NOT construct, slugify, shorten, or otherwise alter a spec path ` +
+  `yourself — the filenames are truncated and a hand-built link will not match the file on disk.\n\n` +
   `Include:\n` +
-  `- A CAPABILITY→FEATURE tree: group by capability in the given order; show each feature as \`#<n> <name>\` with ` +
-  `its id and a link to \`specs/<NNNN>-<slug>.md\`.\n` +
+  `- A CAPABILITY→FEATURE tree: group by capability in the given order (use \`capabilityTree\`); show each feature as ` +
+  `\`#<n> <name>\` with its id and a link whose target is that feature's exact \`spec\` value.\n` +
   `- The RECOMMENDED BUILD ORDER as a numbered list (#1 first), each entry with id, name, capability, and its ` +
   `dependsOn ids.\n` +
   `- Flag any feature whose mergedFrom is non-empty (it absorbed duplicate features).\n\n` +
@@ -1125,18 +1374,22 @@ await agent(
 // ACCEPTANCE writer — the single surface that flags coverage gaps loudly (each
 // feature spec's acceptance criteria are drawn from here). Written from the
 // extracted behavior data of the SURVIVING (post-merge) features; agent invents nothing.
-const behaviorIndex = ordered.map(s => ({
-  sliceId: s.id, name: s.name, epicId: s.epicId,
-  coverage: (s.behavior && s.behavior.coverage) || 'none',
-  acceptanceCriteria: (s.behavior && s.behavior.acceptanceCriteria) || [],
-  testRefs: (s.behavior && s.behavior.testRefs) || [],
-}))
+// The surviving features (light) + the behavior side-cars to pull their acceptance
+// criteria from. Criteria live in the per-capability behavior side-cars (written at
+// discovery), NOT in the checkpoint — the ACCEPTANCE writer reads them from disk.
+const survivors = ordered.map(s => ({ sliceId: s.id, name: s.name, epicId: s.epicId }))
+const behaviorFiles = [...new Set(ordered.map(s => s.epicId))].map(behaviorCarPath)
 await agent(
-  `You are the PortKit ACCEPTANCE writer. Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria, ` +
+  `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria, ` +
   `grouped by capability and mapped to feature id, each with its source test \`path:line\` refs.\n\n` +
+  `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceId", "coverage", ` +
+  `"acceptanceCriteria", "testRefs" } ] }\`):\n${behaviorFiles.map(f => `- \`${f}\``).join('\n')}\n` +
+  `READ them and index by \`sliceId\`. For EACH surviving feature below, emit its criteria/testRefs/coverage from ` +
+  `that index; if a feature's entry (or its file) is missing, treat coverage as 'none'. Use ONLY what the ` +
+  `side-cars contain — do NOT invent criteria.\n\n` +
   `At the TOP, add a COVERAGE SUMMARY table (feature → good/thin/none) and LOUDLY flag every feature whose coverage ` +
-  `is 'thin' or 'none' as a rebuild risk — never paper over missing coverage. Use ONLY the data provided; do not ` +
-  `invent criteria.\n\nDATA:\n${JSON.stringify(behaviorIndex, null, 2)}\n\n${GROUND_RULE}`,
+  `is 'thin' or 'none' as a rebuild risk — never paper over missing coverage.\n\n` +
+  `SURVIVING FEATURES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
   { phase: 'Synthesize', label: 'acceptance' }
 )
 
@@ -1144,7 +1397,7 @@ await agent(
 // glossary + cross-cutting conventions into one doc a weak model reads once and
 // every feature spec references (instead of restating).
 await agent(
-  `You are the PortKit ARCHITECTURE writer. Write \`${OUT}/ARCHITECTURE.md\` — the system/technical spec a weak ` +
+  `You are the PortKit ARCHITECTURE writer. ${rewriteClause(`${OUT}/ARCHITECTURE.md`)} Write \`${OUT}/ARCHITECTURE.md\` — the system/technical spec a weak ` +
   `local model reads ONCE to understand how the pieces fit, then every feature spec references it.\n\n` +
   `Sections (in order):\n` +
   `- Tech stack & build/test: languages, build system, test framework(s), where tests live, dependency manifests.\n` +
@@ -1161,7 +1414,7 @@ await agent(
 // fields (goals/non-goals/metrics/users) are inferred and MUST be tagged; the
 // functional requirements are grounded (one per capability, cited).
 await agent(
-  `You are the PortKit PRD writer. Write \`${OUT}/PRD.md\` — a Product Requirements Document RECONSTRUCTED from ` +
+  `You are the PortKit PRD writer. ${rewriteClause(`${OUT}/PRD.md`)} Write \`${OUT}/PRD.md\` — a Product Requirements Document RECONSTRUCTED from ` +
   `the observed behavior of the source (you are reverse-engineering; the source does not state its own intent).\n\n` +
   `Sections (in order):\n` +
   `- Overview / Problem: what the software does and the problem it appears to solve.\n` +
@@ -1176,7 +1429,9 @@ await agent(
   { phase: 'Synthesize', label: 'prd' }
 )
   await saveStage('docs', {})
+  didWorkThisTurn = true // the doc family (4 agents) ran this turn
 }
+if (budgetYieldNow()) return yieldForBudget('docs')
 
 // ===========================================================================
 // Stage: ADRs — discover architecturally significant DECISIONS observable in the
@@ -1207,6 +1462,7 @@ if (decisions.length) {
   await pooled(decisions.map((d, i) => () => agent(
     `You are the PortKit ADR writer. Write ONE Architecture Decision Record in MADR format to ` +
     `\`${OUT}/adr/${pad(i + 1)}-${slug(d.title)}.md\`.\n\n` +
+    `${rewriteClause(`${OUT}/adr/${pad(i + 1)}-${slug(d.title)}.md`)}\n\n` +
     `Sections (in order):\n` +
     `- Title: \`${d.title}\`.\n` +
     `- Status: \`Reconstructed\` (this ADR is reverse-engineered, not an original decision record).\n` +
@@ -1224,7 +1480,9 @@ if (decisions.length) {
     log(`ℹ️  ${note}`); dropped.push(note)
   }
   await saveStage('adrs', { adrs: decisions })
+  didWorkThisTurn = true // ADR discovery + writers ran this turn
 }
+if (budgetYieldNow()) return yieldForBudget('adrs', { adrs: decisions.length })
 
 // ===========================================================================
 // Stage: Write specs + critic. Over-scale decision (computed once, then persisted
@@ -1233,21 +1491,31 @@ if (decisions.length) {
 // runWriteAndFinish advances the `written` checkpoint each pass and CLEARS the
 // checkpoint on completion.
 // ===========================================================================
+// Two independent reasons to partition the write phase into resumable passes: AGENT over-scale
+// (projected agents near the ~1000 ceiling) and a TOKEN budget (chunk to fit a subscription
+// window). Either engages small/batched writes; a token budget additionally makes each pass small.
 let partitioned
 if (RESUMING && stageDone(savedStage, 'writing') && typeof checkpoint.partitioned === 'boolean') {
-  partitioned = checkpoint.partitioned
+  partitioned = checkpoint.partitioned || tokenBudgetSet()
 } else {
   const projected = projectAgents({
     epicCount: epics.length, sliceCount: ordered.length,
     adrCount: decisions.length, maxAdrs: MAX_ADRS, gapfillRounds: MAX_GAPFILL_ROUNDS,
   })
-  partitioned = projected > SAFE_BUDGET
-  if (partitioned) {
+  const overScale = projected > SAFE_BUDGET
+  partitioned = overScale || tokenBudgetSet()
+  if (overScale) {
     const note = `Over-scale: projected ~${projected} agents exceeds the safe budget (${SAFE_BUDGET}); partitioning feature-spec writing into resumable passes. Nothing dropped.`
     log(`⚖️  ${note}`); dropped.push(note)
+  } else if (tokenBudgetSet()) {
+    const note = `Token budget in effect (~${effectiveTokenTotal()} tokens, reserve ${TOKEN_RESERVE}); writing feature specs in small resumable passes sized to the subscription window. Nothing dropped.`
+    log(`💰 ${note}`); dropped.push(note)
   }
 }
-await saveStage('writing', { partitioned, ordered, adrs: decisions, written: checkpoint.written || [] })
+// NOTE: `ordered` is deliberately NOT persisted (it is the O(slices) aggregate that
+// blew the checkpoint size budget); it is recomputed deterministically from the light
+// side-cars + persisted merges on resume. Only small state goes in the checkpoint.
+await saveStage('writing', { partitioned, adrs: decisions, written: checkpoint.written || [] })
 return await runWriteAndFinish({
   ordered, adrs: decisions, partitioned, priorWritten: checkpoint.written || [],
   extraCounts: {

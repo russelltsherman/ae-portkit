@@ -50,6 +50,14 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      per discovery checkpoint; defaults to `maxConcurrency` — lower it to checkpoint more often on a
      flaky connection), and `maxAgents` (the per-run agent ceiling used for the over-scale guard;
      defaults to `1000` — the runtime's hard cap).
+   - **Token/subscription-budget knobs** (for very large projects — process the kit in chunks that
+     each fit within a subscription usage window): `maxTokensPerRun` (default `0` = unlimited): a
+     per-invocation output-token ceiling. When reached, the run **voluntarily pauses** at the next
+     checkpoint (persisting progress) and returns `stoppedForBudget: true` + `resumeRequired: true`
+     instead of pushing until a hard spend-limit abort. `tokenReserve` (default `50000`): tokens
+     held back for the finishing critic pass. Precedence: a runtime `+Nk` directive (`budget.total`)
+     wins over `maxTokensPerRun`; with neither set, behavior is exactly as before (no pausing). Pair
+     with `/loop /portkit …` to drive a huge project to completion across many budget-sized chunks.
    - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N feature specs
      (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
      adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —
@@ -78,6 +86,10 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      (`outDir`), the feature/ADR counts, any **truncations** (real coverage gaps — surface them),
      and the **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human
      must resolve.
+   - If `stoppedForBudget` is `true`, the run **voluntarily paused** because it reached its token
+     budget (`maxTokensPerRun` or a `+Nk` directive), not because of an error. Treat it exactly like
+     any other `resumeRequired` result — re-run (or `/loop`) to continue the next chunk. It reports
+     the `stage` it paused at.
    - If the run is **interrupted** (crash, timeout, spend limit, API outage), just re-run the same
      command: it checkpoints after every stage and resumes from where it stopped (see **Resuming**).
 
@@ -90,8 +102,18 @@ instead of reprocessing: the expensive per-capability discovery, in particular, 
 by batch. The checkpoint is fingerprinted by the input dir, so a checkpoint for a different source is
 ignored (never a wrong-codebase resume), and it is deleted automatically when the run completes.
 
-- `--fresh` — ignore any existing checkpoint and reprocess from scratch (use after the source
-  changed, or to regenerate a completed kit).
+- **Token/subscription-window chunking** uses this same machinery: with `maxTokensPerRun` (or a
+  `+Nk` directive) set, a run stops at the token ceiling and hands back a resume point, so a very
+  large project is completed as a series of budget-sized chunks (`/loop /portkit …` drives it). The
+  ceiling is **per run**, not cumulative — each resume is a fresh window. Nothing is ever dropped.
+- `--fresh` — ignore any existing checkpoint and reprocess from scratch. A fresh run also
+  **clears the old checkpoint and OVERWRITES** the prior kit's docs/specs (so you never get a
+  half-old/half-new "Frankenstein" kit). Orphaned specs from a *larger* prior run may remain — use a
+  clean or new `--output` dir if that matters.
+- **Scope guard:** auto-resume **refuses** and errors if the checkpoint was built with different
+  `maxEpics`/`limitSlices` than the current run (e.g. resuming a `limitSlices` smoke test with a
+  full-run command), rather than silently continuing the smaller scope. Use `--fresh` (clean dir)
+  for a full run, or match the original knobs to continue.
 - `resume: true` — demand a checkpoint and continue it; errors if none exists (auto-resume is the
   normal path, so you rarely need this explicitly).
 - `checkpointEvery` — capabilities analyzed per discovery checkpoint (default `maxConcurrency`).

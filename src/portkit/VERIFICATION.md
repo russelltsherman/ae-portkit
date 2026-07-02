@@ -76,8 +76,10 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
 | 6 | ADRs present + evidenced | ≥1 `adr/NNNN-*.md`, each in MADR form with status `Reconstructed`, a `path:line`-evidenced decision, and rationale/"why" tagged `[INFERRED]` |
 | 7 | Inference tagged, not asserted | PRD goals/non-goals/success-metrics and ADR rationale carry `[INFERRED]`; functional requirements cite `path:line`. No inference is presented as observed fact |
 | 8 | Resumability | Interrupt a run mid-discovery (Ctrl-C / kill), confirm `<output>/.portkit/ir.json` exists with a `stage`, then re-run the SAME command: it logs `↩️ Resuming from checkpoint stage '…'`, does NOT re-run `map:survey` or already-analyzed `discover:*` capabilities, and finishes. On clean completion the checkpoint file is gone. `--fresh` forces a full reprocess |
+| 9 | Token-budget chunking | Run with a small `maxTokensPerRun` (or a `+Nk` directive). The run returns `stoppedForBudget: true` + `resumeRequired: true`, having advanced past `mapped`, and `.portkit/ir.json` reflects the paused `stage`. Repeated resumes (or `/loop`) complete the kit with **every** feature spec written exactly once and no dangling `INDEX.md` links; the checkpoint is cleared on final completion. With **no** budget set, a normal run finishes in one pass (byte-identical) |
+| 10 | Scope/fresh safety | Resuming a checkpoint built with different `maxEpics`/`limitSlices` aborts loudly (does not silently continue the smaller scope). A `--fresh` run over an existing kit clears `.portkit` and overwrites the prior docs (no stale 5-epic `INDEX.md` left behind) |
 
-### Gate 9 — the core bet (stretch, the only test that truly validates the premise)
+### Gate 11 — the core bet (stretch, the only test that truly validates the premise)
 
 Hand a handful of ordered feature specs (+ ARCHITECTURE.md) to an **actual weak local model**
 (ollama/omlx) and confirm it can produce passing units **from the docs alone**, without the source.
@@ -86,4 +88,4 @@ If it can't, the IR — not the orchestration — is what needs work.
 ## Known limitation
 
 The plugin cannot prove its own output is good (it produces docs only). Gate 9 is the real proof and
-must be run by a human with a local model; Gates 1–8 are necessary but not sufficient.
+must be run by a human with a local model; Gates 1–10 are necessary but not sufficient.

@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -444,6 +444,83 @@ test('chunk: covers every item exactly once (no drops)', () => {
   const flat = chunk(items, 8).flat()
   assert.equal(flat.length, 37)
   assert.deepEqual(flat, items)
+})
+
+// --- slug / pad / specName (spec filename = INDEX link, single source of truth) ---
+// Regression guard for the dangling-INDEX-link bug: spec FILES are named with a
+// 48-char-truncated slug, but the INDEX writer used to recompute an UNtruncated slug
+// for its links, so any feature name longer than 48 chars produced a link that 404'd
+// against the file on disk — even on a fully successful run. Both sides now derive from
+// specName(), so these tests pin that the filename is stable and truncated.
+
+test('slug: truncates to 48 characters', () => {
+  const { slug } = loadDeterministic()
+  const long = 'a'.repeat(100)
+  assert.equal(slug(long).length, 48)
+})
+
+test('slug: kebab-cases, lowercases, trims, and never empty', () => {
+  const { slug } = loadDeterministic()
+  assert.equal(slug('Hello World!'), 'hello-world')
+  assert.equal(slug('  __Foo__  '), 'foo')
+  assert.equal(slug('***'), 'slice') // no alphanumerics -> fallback
+})
+
+test('pad: zero-pads a build number to 4 digits', () => {
+  const { pad } = loadDeterministic()
+  assert.equal(pad(1), '0001')
+  assert.equal(pad(42), '0042')
+  assert.equal(pad(1234), '1234')
+})
+
+test('specName: <NNNN>-<slug>.md with the slug truncated to 48 chars', () => {
+  const { specName, slug, pad } = loadDeterministic()
+  // The exact case observed on disk that dangled: a >48-char name is truncated.
+  const name = 'Default config schema and DEFAULT_CONFIG constant'
+  const got = specName(1, name)
+  assert.equal(got, '0001-default-config-schema-and-default-config-constan.md')
+  // It is exactly pad + '-' + capped slug + '.md' (the file writer's construction).
+  assert.equal(got, `${pad(1)}-${slug(name)}.md`)
+  // And the name part is capped: a re-slugified FULL name (the old buggy INDEX link)
+  // would NOT match — which is precisely why the link must reuse specName, not rebuild.
+  const untruncated = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  assert.notEqual(`0001-${untruncated}.md`, got)
+})
+
+test('specName: short names are not truncated (round-trip stable)', () => {
+  const { specName } = loadDeterministic()
+  assert.equal(specName(3, 'outputJson helper structured success envelope'),
+    '0003-outputjson-helper-structured-success-envelope.md')
+})
+
+// --- budgetExhausted (token/subscription-window voluntary-yield decision) ---
+// PURE decision: takes plain numbers (never the `budget` object), so the impure wrapper
+// that reads the runtime `budget` global can delegate the comparison here and stay testable.
+
+test('budgetExhausted: unlimited ceiling never yields (byte-identical to no-budget today)', () => {
+  const { budgetExhausted } = loadDeterministic()
+  for (const total of [undefined, null, 0, -1, Infinity, NaN]) {
+    assert.equal(budgetExhausted(total, 999_999, 50_000), false, `total=${total}`)
+  }
+})
+
+test('budgetExhausted: yields only once remaining falls to the reserve', () => {
+  const { budgetExhausted } = loadDeterministic()
+  assert.equal(budgetExhausted(100_000, 40_000, 50_000), false) // 60k remaining > 50k reserve
+  assert.equal(budgetExhausted(100_000, 60_000, 50_000), true)  // 40k remaining <= 50k reserve
+  assert.equal(budgetExhausted(100_000, 50_000, 50_000), true)  // boundary: exactly reserve -> yield
+})
+
+test('budgetExhausted: overspend (spent > total) yields', () => {
+  const { budgetExhausted } = loadDeterministic()
+  assert.equal(budgetExhausted(100_000, 130_000, 50_000), true)
+})
+
+test('budgetExhausted: zero reserve yields only when fully spent', () => {
+  const { budgetExhausted } = loadDeterministic()
+  assert.equal(budgetExhausted(100_000, 99_999, 0), false)
+  assert.equal(budgetExhausted(100_000, 100_000, 0), true)
+  assert.equal(budgetExhausted(100_000, undefined, 0), false) // spent defaults to 0
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only

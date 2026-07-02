@@ -17,6 +17,10 @@ import { dirname, join } from 'node:path'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, 'portkit.js')
 
+// The checkpoint (ir.json) is small — heavy analysis lives in per-capability side-cars
+// the discovery agents write — so persist/load use a single agent: persist writes the
+// JSON verbatim between these fences, load returns it parsed. The mock parses the same
+// fences and models the side-cars in `store.files`.
 const IR_OPEN = '<<<PORTKIT-IR-JSON>>>'
 const IR_CLOSE = '<<<END-PORTKIT-IR-JSON>>>'
 
@@ -45,10 +49,18 @@ function scenario({ epics = ['e1'], slicesPerEpic = 2, merges = [], decisions = 
 // A mock runtime sharing `store` across invocations (so IR persist on pass 1 is
 // visible to loadIR on resume). Records every agent label, log, and slice write.
 function makeRuntime(sc, store) {
-  const rec = { labels: [], logs: [], phases: [] }
+  const rec = { labels: [], logs: [], phases: [], prompts: [] }
+  // Token-budget model: a per-INVOCATION spend pool (reset here because makeRuntime is created
+  // fresh per run() — mirroring budget.spent() being a per-turn pool that refills on resume).
+  // costPerAgent defaults to 0, so tests that set no budget see spent=0 / total=null = unlimited
+  // = byte-identical behavior. store.tokenTotal drives the runtime "+Nk" precedence path.
+  let spent = 0
+  const costPerAgent = store.costPerAgent || 0
   async function agent(prompt, opts = {}) {
     const label = opts.label || ''
     rec.labels.push(label)
+    rec.prompts.push({ label, prompt })
+    spent += costPerAgent
     if (label === 'preflight:probe') return { exists: true, isDir: true, fileCount: 5 }
     if (label === 'map:survey') {
       return {
@@ -57,20 +69,47 @@ function makeRuntime(sc, store) {
         epics: sc.epics.map(id => ({ id, name: id, kind: 'endpoint', entryPoints: ['main.go:1'], summary: id })),
       }
     }
-    if (label.startsWith('discover:')) return { slices: sc.slicesByEpic[label.slice('discover:'.length)] || [] }
+    if (label.startsWith('discover:')) {
+      // The real agent WRITES the full slices (incl. thread) to a side-car AND a light
+      // projection, then returns the slices; the workflow keeps only light fields.
+      const e = label.slice('discover:'.length)
+      const slices = sc.slicesByEpic[e] || []
+      store.files = store.files || {}
+      const sp = (prompt.match(/`([^`]+\.slices\.json)`/) || [])[1]
+      const lp = (prompt.match(/`([^`]+\.light\.json)`/) || [])[1]
+      if (sp) store.files[sp] = { slices }
+      if (lp) store.files[lp] = slices.map(s => ({ id: s.id, name: s.name, capability: s.capability, behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [] }))
+      return { slices }
+    }
+    if (label === 'resume:scan') {
+      // A capability is done iff BOTH its light + behavior side-cars exist on disk.
+      const files = Object.keys(store.files || {})
+      const light = new Set(files.filter(p => p.endsWith('.light.json')).map(p => p.split('/').pop().replace('.light.json', '')))
+      const behav = new Set(files.filter(p => p.endsWith('.behavior.json')).map(p => p.split('/').pop().replace('.behavior.json', '')))
+      return { epicIds: [...light].filter(id => behav.has(id)) }
+    }
+    if (label.startsWith('light:')) {
+      const id = label.slice('light:'.length)
+      return { slices: (store.files && store.files[carPaths(id).light]) || [] }
+    }
     if (label.startsWith('behavior:')) {
+      // Likewise: the real agent WRITES the behavior side-car and returns perSlice.
       const e = label.slice('behavior:'.length)
-      return { perSlice: (sc.slicesByEpic[e] || []).map(s => ({ sliceId: s.id, coverage: 'good', acceptanceCriteria: ['ac'], testRefs: ['x_test.go:1'] })) }
+      const perSlice = (sc.slicesByEpic[e] || []).map(s => ({ sliceId: s.id, coverage: 'good', acceptanceCriteria: ['ac'], testRefs: ['x_test.go:1'] }))
+      const path = (prompt.match(/`([^`]+\.behavior\.json)`/) || [])[1]
+      if (path) { store.files = store.files || {}; store.files[path] = { perSlice } }
+      return { perSlice }
     }
     if (label === 'synthesize') return { merges: sc.merges }
     if (label === 'adr:discover') return { decisions: sc.decisions || [] }
     if (label === 'ir:persist') {
+      // Small checkpoint written verbatim between fences — parse it straight back.
       const json = prompt.slice(prompt.indexOf(IR_OPEN) + IR_OPEN.length, prompt.indexOf(IR_CLOSE)).trim()
       store.ir = JSON.parse(json)
       return 'ok'
     }
     if (label === 'ir:load') return store.ir || { ordered: [] }
-    if (label === 'ir:clear') { store.ir = undefined; return 'ok' }
+    if (label === 'ir:clear') { store.ir = undefined; store.files = undefined; return 'ok' }
     if (label.startsWith('slice:')) {
       const n = Number(label.split(':')[1])
       // Simulate a failed write (transient API error / spend-limit stop). Slices in
@@ -86,7 +125,11 @@ function makeRuntime(sc, store) {
   }
   const log = (m) => rec.logs.push(String(m))
   const phase = (p) => rec.phases.push(String(p))
-  const budget = { total: null, spent: () => 0, remaining: () => Infinity }
+  const budget = {
+    total: store.tokenTotal ?? null,
+    spent: () => spent,
+    remaining: () => (store.tokenTotal != null ? Math.max(0, store.tokenTotal - spent) : Infinity),
+  }
   const noop = async () => { throw new Error('parallel/pipeline not expected in mock run') }
   return { agent, log, phase, budget, parallel: noop, pipeline: noop, workflow: noop, rec }
 }
@@ -174,7 +217,7 @@ test('over-scale: partitions into resumable passes and never drops a slice', asy
   assert.equal(p1.result.resumeRequired, true)
   assert.ok(p1.result.counts.slicesRemaining > 0)
   assert.ok(p1.rec.labels.includes('ir:persist'), 'over-scale pass 1 must persist IR')
-  assert.ok(store.ir && store.ir.ordered.length === 12, 'IR carries all 12 features')
+  assert.ok(store.ir && store.ir.slicesDiscovered === 12, 'checkpoint records all 12 discovered features (slice data is in side-cars)')
   assert.equal(store.ir.written.length, p1.result.counts.slicesWritten)
   // ADR discovery runs on pass 1 (before partitioning), never on a resume pass
   assert.ok(p1.rec.labels.includes('adr:discover'), 'ADRs discovered on pass 1')
@@ -220,7 +263,7 @@ test('single-pass partial failure persists IR and is resumable (spend-limit mid-
   assert.equal(p1.result.counts.slicesWritten, 3)
   assert.equal(p1.result.counts.slicesRemaining, 3)
   assert.ok(p1.rec.labels.includes('ir:persist'), 'partial-failure single pass must persist IR')
-  assert.ok(store.ir && store.ir.ordered.length === 6, 'persisted IR carries all 6 features')
+  assert.ok(store.ir && store.ir.slicesDiscovered === 6, 'checkpoint records all 6 discovered features (slice data is in side-cars)')
   assert.deepEqual([...store.ir.written].sort((a, b) => a - b), [1, 2, 3])
   // a non-final pass must NOT run the critic
   assert.ok(!p1.rec.labels.includes('critic:1'), 'no critic on a partial pass')
@@ -285,11 +328,26 @@ test('explicit resume with no checkpoint fails loudly instead of silently doing 
 // Helpers to hand-build a checkpoint at a given stage, as if a prior run had been
 // interrupted there. `source: '.'` matches BASE.inputDir so auto-detect adopts it.
 const epicsData = (ids) => ids.map(id => ({ id, name: id, kind: 'endpoint', entryPoints: ['main.go:1'], summary: id }))
-const perEpicFor = (sc, id) => ({
-  epicId: id,
-  slices: sc.slicesByEpic[id],
-  behavior: sc.slicesByEpic[id].map(s => ({ sliceId: s.id, coverage: 'good', acceptanceCriteria: ['ac'], testRefs: ['x_test.go:1'] })),
+// The checkpoint no longer stores per-capability slice data — only which capabilities
+// are DONE (epicsDone). The slice data is rebuilt from the durable side-cars, which a
+// prior (interrupted) run would have written to disk (see seedCars).
+// Side-car paths must match the workflow: `${OUT}/.portkit/epics/${slug(id)}.<kind>.json`.
+// The scenario epic ids are already slug-safe.
+const carPaths = (id) => ({
+  slices: `${BASE.outputDir}/.portkit/epics/${id}.slices.json`,
+  behavior: `${BASE.outputDir}/.portkit/epics/${id}.behavior.json`,
+  light: `${BASE.outputDir}/.portkit/epics/${id}.light.json`,
 })
+// Seed the on-disk side-cars a prior (interrupted) run would have left behind.
+const seedCars = (store, sc, ids) => {
+  store.files = store.files || {}
+  for (const id of ids) {
+    const p = carPaths(id)
+    store.files[p.slices] = { slices: sc.slicesByEpic[id] }
+    store.files[p.behavior] = { perSlice: sc.slicesByEpic[id].map(s => ({ sliceId: s.id, coverage: 'good', acceptanceCriteria: ['ac'], testRefs: ['x_test.go:1'] })) }
+    store.files[p.light] = sc.slicesByEpic[id].map(s => ({ id: s.id, name: s.name, capability: s.capability, behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [] }))
+  }
+}
 
 test('auto-resume from a MAP checkpoint skips map but still runs discovery', async () => {
   const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 })
@@ -307,7 +365,8 @@ test('auto-resume from a MAP checkpoint skips map but still runs discovery', asy
 
 test('auto-resume from a PARTIAL discovery checkpoint only analyzes the remaining capabilities', async () => {
   const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 2 })
-  const store = { ir: { stage: 'discovering', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), perEpic: [perEpicFor(sc, 'e1')] } }
+  const store = { ir: { stage: 'discovering', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), epicsDone: ['e1'] } }
+  seedCars(store, sc, ['e1']) // e1's side-cars were written before the interruption
   const { result, rec } = await run({ ...BASE }, sc, store)
 
   assert.equal(result.ok, true)
@@ -320,7 +379,8 @@ test('auto-resume from a PARTIAL discovery checkpoint only analyzes the remainin
 
 test('auto-resume from a DISCOVERED checkpoint skips map + discovery, synthesizes onward', async () => {
   const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 })
-  const store = { ir: { stage: 'discovered', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), perEpic: sc.epics.map(id => perEpicFor(sc, id)) } }
+  const store = { ir: { stage: 'discovered', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), epicsDone: sc.epics } }
+  seedCars(store, sc, sc.epics) // all capabilities' side-cars already on disk
   const { result, rec } = await run({ ...BASE }, sc, store)
 
   assert.equal(result.ok, true)
@@ -350,4 +410,187 @@ test('--fresh ignores an existing checkpoint and does not even probe for one', a
   assert.ok(!rec.labels.includes('ir:load'), '--fresh does not probe for a checkpoint')
   assert.ok(rec.labels.includes('map:survey'), '--fresh reruns the full analysis')
   assert.equal(result.counts.slicesWritten, 2)
+})
+
+// --- side-cars keep the checkpoint small (the fix for the live persist hang) ------
+// The heavy analysis (each slice's component thread + extracted acceptance criteria)
+// must go to per-capability side-car files, NOT into ir.json — that is what kept the
+// checkpoint small enough to persist through a single agent without stalling.
+test('discovery writes heavy analysis to side-cars; the checkpoint stays light', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 })
+  const store = { failNs: new Set([1, 2, 3, 4, 5, 6]) } // fail all writes so the checkpoint persists (resumeRequired)
+  const { result } = await run({ ...BASE }, sc, store)
+  assert.equal(result.resumeRequired, true)
+
+  // Side-cars were written to disk for every capability, and they carry the heavy data.
+  const cars = Object.keys(store.files || {})
+  assert.ok(cars.some(p => p.endsWith('e1.slices.json')) && cars.some(p => p.endsWith('e2.slices.json')), 'slices side-cars written')
+  assert.ok(cars.some(p => p.endsWith('e1.behavior.json')) && cars.some(p => p.endsWith('e2.behavior.json')), 'behavior side-cars written')
+  assert.ok(cars.some(p => p.endsWith('e1.light.json')) && cars.some(p => p.endsWith('e2.light.json')), 'light side-cars written')
+  const sliceCar = store.files[carPaths('e1').slices]
+  assert.ok(sliceCar.slices[0].thread, 'the slices side-car carries the component thread')
+  assert.ok(store.files[carPaths('e1').behavior].perSlice[0].acceptanceCriteria, 'the behavior side-car carries acceptance criteria')
+
+  // The persisted checkpoint is TINY: NO slice data at all — no thread, no criteria,
+  // and not even the light per-slice list (that is rebuilt from the light side-cars).
+  const irText = JSON.stringify(store.ir)
+  assert.ok(!/"thread"/.test(irText), 'checkpoint carries no component threads')
+  assert.ok(!/"acceptanceCriteria"/.test(irText), 'checkpoint carries no acceptance criteria')
+  assert.ok(!/"behaviorSummary"/.test(irText), 'checkpoint carries no per-slice summaries (rebuilt from side-cars)')
+  assert.equal(store.ir.perEpic, undefined, 'checkpoint holds no per-capability slice arrays')
+  // it DOES carry the tiny completion index synthesis/resume needs
+  assert.deepEqual(store.ir.epicsDone.sort(), ['e1', 'e2'], 'checkpoint records which capabilities are done')
+  assert.equal(store.ir.slicesDiscovered, 6, 'checkpoint records the discovered count')
+})
+
+// Resume after a discovery interruption must NOT re-discover, and the feature writers
+// read the heavy data from the on-disk side-cars (seeded by the prior run).
+test('resume reuses on-disk side-cars instead of re-running discovery', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 })
+  const store = { ir: { stage: 'discovered', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), epicsDone: sc.epics } }
+  seedCars(store, sc, sc.epics)
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.ok(rec.labels.includes('resume:scan'), 'resume scans on-disk side-cars for completed capabilities')
+  assert.ok(rec.labels.some(l => l.startsWith('light:')), 'resume rebuilds light slices from side-cars')
+  assert.ok(!rec.labels.some(l => l.startsWith('discover:')), 'no capability is re-discovered')
+  assert.ok(!rec.labels.some(l => l.startsWith('behavior:')), 'no behavior is re-extracted')
+  assert.equal(result.counts.slicesWritten, 6, 'all features written from the checkpoint + side-cars')
+})
+
+// ===========================================================================
+// Token/subscription-budget-aware chunking
+// ===========================================================================
+// The budget model: costPerAgent debits a per-invocation pool; a tiny ceiling (maxTokensPerRun)
+// with reserve 0 exhausts it almost immediately, so the run yields at the FIRST armed checkpoint
+// (the progress guard guarantees ≥1 unit of work per turn first). maxConcurrency:1 makes each
+// capability its own discovery batch and each write pass a single spec, for deterministic yields.
+
+test('token budget: yields mid-discovery (progress guard writes one batch first) and is resumable', async () => {
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 1 })
+  const store = { costPerAgent: 100_000 } // one agent call exhausts a 100k ceiling
+  const { result, rec } = await run(
+    { ...BASE, maxConcurrency: 1, maxTokensPerRun: 100_000, tokenReserve: 0 }, sc, store)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, true)
+  assert.equal(result.stoppedForBudget, true, 'yielded for the token budget, not an error')
+  assert.equal(result.stage, 'discovering')
+  assert.deepEqual(store.ir.epicsDone, ['e1'], 'exactly one capability analyzed before yielding (progress guard)')
+  assert.ok(!rec.labels.includes('synthesize'), 'did not push on into synthesis')
+  assert.ok(!rec.labels.includes('index'), 'did not author the doc family')
+})
+
+test('token budget: write phase partitions below agent over-scale and yields mid-write (per-epic batches)', async () => {
+  // 3 epics × 2 slices = 6 features — far below the agent over-scale threshold, so ONLY the token
+  // budget can trigger partitioning. planEpicBatches never splits an epic, so multiple epics are
+  // needed to observe a mid-write yield (a single big epic writes all its slices in one batch).
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 2 })
+  const store = { costPerAgent: 100_000 }
+  const args = { ...BASE, maxConcurrency: 1, maxTokensPerRun: 100_000, tokenReserve: 0 }
+  let result, passes = 0, sawWritingYield = false, sawTokenLog = false
+  do {
+    let rec
+    ;({ result, rec } = await run({ ...args, ...(passes > 0 ? { resume: true } : {}) }, sc, store))
+    if (rec.logs.some(l => /Token budget in effect/.test(l))) sawTokenLog = true
+    if (result.stoppedForBudget && result.stage === 'writing') {
+      sawWritingYield = true
+      const w = (store.ir.written || []).length
+      assert.ok(w >= 1 && w < 6, `partial write progress persisted before yielding: ${w}/6`)
+    }
+    passes++
+    assert.ok(passes < 40, 'must converge')
+  } while (result.resumeRequired)
+
+  assert.ok(sawTokenLog, 'token-budget partitioning engaged below agent over-scale (logged)')
+  assert.ok(sawWritingYield, 'the write phase yielded mid-write at least once')
+  assert.equal(store.written.size, 6, 'every feature still written exactly once')
+})
+
+test('token budget: repeated resumes complete the kit with every slice written exactly once', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 }) // N = 4 features
+  const store = { costPerAgent: 100_000 } // yield after each armed checkpoint
+  const args = { ...BASE, maxConcurrency: 1, maxTokensPerRun: 100_000, tokenReserve: 0 }
+  const stagesSeen = new Set()
+  let result, passes = 0
+  do {
+    ({ result } = await run({ ...args, ...(passes > 0 ? { resume: true } : {}) }, sc, store))
+    if (result.stoppedForBudget) stagesSeen.add(result.stage)
+    passes++
+    assert.ok(passes < 30, `must converge (stuck after ${passes} passes)`) // no infinite yield loop
+  } while (result.resumeRequired)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false, 'eventually finishes')
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3, 4], 'every slice written exactly once')
+  assert.equal(result.counts.slicesWritten, 4)
+  assert.ok(stagesSeen.has('discovering'), 'chunked through discovery')
+  assert.ok(stagesSeen.has('writing'), 'chunked through the write phase')
+  assert.equal(store.ir, undefined, 'checkpoint cleared on final completion')
+})
+
+test('footgun-1: resuming a checkpoint built with different scale knobs aborts loudly', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
+  // A smoke-test checkpoint (maxEpics 5, limitSlices 3) — resuming it with a full-run command
+  // must NOT silently continue the smaller scope.
+  const store = {
+    ir: {
+      stage: 'mapped', source: '.', epics: [{ id: 'e1', name: 'e1', kind: 'endpoint' }],
+      scale: { maxEpics: 5, limitSlices: 3 },
+    },
+  }
+  const { result } = await run({ ...BASE, maxEpics: 40, limitSlices: 0 }, sc, store)
+
+  assert.equal(result.ok, false, 'aborts rather than resuming the smaller scope')
+  assert.match(result.error, /maxEpics=5, limitSlices=3/)
+  assert.match(result.error, /fresh: true/)
+  assert.deepEqual(result.checkpointScale, { maxEpics: 5, limitSlices: 3 })
+  assert.deepEqual(result.requestedScale, { maxEpics: 40, limitSlices: 0 })
+})
+
+test('footgun-1: resuming with the SAME scale knobs continues normally', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
+  const store = {
+    ir: {
+      stage: 'mapped', source: '.', epics: [{ id: 'e1', name: 'e1', kind: 'endpoint', entryPoints: ['main.go:1'], summary: 'e1' }],
+      scale: { maxEpics: 40, limitSlices: 0 },
+    },
+  }
+  const { result } = await run({ ...BASE }, sc, store) // defaults match the checkpoint's scale
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false)
+  assert.equal(result.counts.slicesWritten, 2)
+})
+
+test('footgun-2: a fresh run clears the checkpoint and instructs writers to OVERWRITE (not skip)', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 1 })
+  const store = { ir: { stage: 'writing', source: '.', written: [1] } } // a stale prior kit's checkpoint
+
+  const { result, rec } = await run({ ...BASE, fresh: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.ok(rec.labels.includes('ir:clear'), 'fresh clears any stale checkpoint up front')
+  assert.ok(!rec.labels.includes('ir:load'), 'fresh never probes the checkpoint')
+  // Every doc/spec writer is told to OVERWRITE on a fresh run.
+  for (const lbl of ['index', 'acceptance', 'arch', 'prd']) {
+    const p = rec.prompts.find(x => x.label === lbl)
+    assert.ok(p && /FRESH run.*OVERWRITE/s.test(p.prompt), `${lbl} writer told to overwrite on fresh`)
+  }
+  const specPrompt = rec.prompts.find(x => x.label.startsWith('slice:'))
+  assert.ok(specPrompt && /OVERWRITE/.test(specPrompt.prompt), 'spec writer told to overwrite on fresh')
+})
+
+test('footgun-2: a normal (non-fresh) run keeps the SKIP-if-exists instruction (resume-safe)', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 1 })
+  const { rec } = await run({ ...BASE }, sc, {})
+  const index = rec.prompts.find(x => x.label === 'index')
+  assert.ok(index && /do NOT rewrite it; return immediately/.test(index.prompt),
+    'normal run skips an existing doc so a resume never re-authors it')
+})
+
+test('no-budget regression: an unset budget yields never and completes in a single pass', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 })
+  const { result } = await run({ ...BASE }, sc, {}) // no maxTokensPerRun, no tokenTotal
+  assert.equal(result.resumeRequired, false, 'no voluntary yield without a budget')
+  assert.ok(!('stoppedForBudget' in result))
+  assert.equal(result.counts.slicesWritten, 6)
 })

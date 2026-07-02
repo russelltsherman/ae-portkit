@@ -73,7 +73,9 @@ specialist agents:
 `inputDir` (default `.`), `outputDir` (default `<inputDir>_recreation`), `maxEpics` (40), `maxAdrs`
 (12), `maxGapfillRounds` (2), `maxConcurrency` (8), `checkpointEvery` (default `maxConcurrency` —
 capabilities analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
-ceiling), `fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
+ceiling), `maxTokensPerRun` (0 = unlimited — a per-invocation token ceiling for subscription-window
+chunking, see below), `tokenReserve` (50000 — tokens held back for the finishing critic pass),
+`fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
 auto-resume is the normal path). (`sourcePath`/`outDir` are accepted as legacy aliases for
 `inputDir`/`outputDir`.) **Features are never capped** — they are the deliverable, so dropping them is
 never an option; genuine over-scale is handled by capability-partitioned resumable passes (see
@@ -100,6 +102,24 @@ already written keep matching their numbers.
 approach the runtime's ~1000-agent ceiling, the analysis + doc family + ADRs run once and feature
 specs are written in **capability-batched passes**, returning `resumeRequired: true` until every
 feature is written. **No feature is ever dropped.**
+
+**Token/subscription-window chunking** rides the same substrate for very large projects. Set
+`maxTokensPerRun` (or use a runtime `+Nk` directive — that takes precedence) and the run **voluntarily
+pauses** the moment its actual spend nears the ceiling: at the next checkpoint boundary — after a
+discovery batch, at a stage boundary, or between small write batches — it persists progress and
+returns `stoppedForBudget: true` + `resumeRequired: true`, rather than pushing until the subscription
+wall hard-aborts it mid-agent (which wastes the in-flight agent's tokens). Re-running (or
+`/loop /portkit …`) continues the next chunk on a fresh window. Two guarantees make this safe: the
+ceiling is **per run**, not cumulative (each resume refills), and a progress guard ensures every turn
+completes **at least one unit of work** before pausing, so it can never no-progress-loop even if the
+window is smaller than a single phase. Token-budgeted write passes batch at **slice granularity**
+(≈`maxConcurrency` specs), so overshoot is bounded even inside one very large capability. With no
+budget set, none of this engages — behavior is byte-identical.
+
+**Fresh & scope safety.** A `fresh` run clears the old checkpoint and **overwrites** the prior kit's
+docs/specs (no half-old/half-new "Frankenstein"); and auto-resume **refuses** a checkpoint whose
+`maxEpics`/`limitSlices` differ from the current run (e.g. resuming a `limitSlices` smoke test with a
+full-run command) instead of silently continuing the smaller scope.
 
 ## Design constraints baked in
 
