@@ -1,104 +1,114 @@
 # portkit
 
-A Claude Code plugin that analyzes a codebase into a **target-neutral, vertical-slice build kit** so
-a *less capable downstream model* (e.g. a quantized local model under ollama/omlx) can recreate the
-project in a different language or framework **from the documents alone** — without reading the
-original source.
+A Claude Code plugin that reverse-engineers a codebase into a **stack-neutral recreation kit** — a
+family of standard planning/design documents (PRD, architecture spec, per-feature specs, ADRs,
+acceptance criteria) — so a *less capable downstream model* (e.g. a quantized local model under
+ollama/omlx) can recreate the software **from the documents alone**, without reading the original
+source.
 
 It produces **documents only**. It does not perform the recreation.
 
-## Why vertical slices
+## Why feature specs
 
-The output is organized by **capability**, not by layer. Each slice is one behavior thread running
-top-to-bottom through every layer it touches (entry → validation → rule → data → persistence →
-**its tests**), self-contained and independently buildable/testable. Horizontal "all-the-models" /
-"all-the-endpoints" docs are demoted to a thin shared **kernel** that slices reference. This is what
-lets a weak model build one verifiable piece at a time instead of holding the whole system in
-context.
+The kit pairs a small number of system-wide documents (PRD, ARCHITECTURE, ADRs) with one
+**feature spec** per capability. Each feature spec is one behavior thread running top-to-bottom
+through every layer it touches (entry → validation → rule → data → persistence → **its acceptance
+criteria**), self-contained and independently buildable/testable. Shared naming, types, and
+cross-cutting conventions live once in `ARCHITECTURE.md`, which every feature spec references instead
+of restating. This is what lets a weak model build one verifiable piece at a time instead of holding
+the whole system in context.
 
 ## Usage
 
 ```
-/portkit <target-lang> [input-dir] [--input <dir>] [--output <dir>]
+/portkit [input-dir] [--input <dir>] [--output <dir>]
 ```
 
 Examples:
 
 ```
-/portkit go                                  # analyze the current repo; add a Go mapping layer
-/portkit rust src/app --output build/portkit # explicit input + output dirs
-/portkit rust --input services/api           # input via flag
-/portkit                                     # neutral core only, no target layer
+/portkit                                  # analyze the current repo
+/portkit src/app --output build/kit       # explicit input + output dirs
+/portkit --input services/api             # input via flag
 ```
 
-- **target-lang** — a single target language; one target per run.
 - **input dir** — codebase to analyze: positional `[input-dir]` or `--input <dir>`. Default `.`.
-- **`--output <dir>`** — where docs are written. Default `<input-dir>/<target-language>`
-  (`<input-dir>/.portkit` if no target).
-
-To cover several targets, run again pointed at the same `--output`: the neutral core is reused and
-only the new `targets/<lang>/` layer is added.
+- **`--output <dir>`** — where docs are written. Default `<input-dir>_recreation` (a sibling of the
+  input dir; output is never nested inside the source tree).
 
 > **Prerequisite:** the Workflow tool is gated behind an env var. Enable it first:
 > `export CLAUDE_CODE_WORKFLOWS=1 && claude`, or persist
 > `{ "env": { "CLAUDE_CODE_WORKFLOWS": "1" } }` in `.claude/settings.local.json`.
 
-## Output (`<source>/.portkit/`)
+## Output (`<input-dir>_recreation/`)
 
 | Path | What |
 |---|---|
-| `00-system-map.md` | Orientation: languages, build, tests, deps, epic inventory |
-| `KERNEL.md` | Naming/type glossary + shared domain vocabulary |
-| `kernel/cross-cutting.md` | Auth/config/logging/error/concurrency conventions |
-| `epics/INDEX.md` | Epic→slice tree **and topological build order** |
-| `epics/<epic>/<NNNN>-<slice>.md` | One self-contained, self-testing vertical slice |
-| `targets/<lang>/dependency-map.md` | Per-dep target strategy (equivalent / reimplement / drop / human-decision) |
-| `targets/<lang>/porting-hazards.md` | Source-language assumptions that break in the target |
-| `targets/<lang>/slice-hints/<NNNN>.md` | Prescriptive per-slice target guidance |
-| `RISKS-AND-GAPS.md` | Unverified claims, thin coverage, non-portable deps, open questions |
+| `PRD.md` | Product requirements reconstructed from observed behavior (intent fields tagged `[INFERRED]`) |
+| `ARCHITECTURE.md` | Tech stack, component inventory, data model + domain vocabulary, data flows, cross-cutting concerns |
+| `INDEX.md` | Recreation roadmap: capability→feature tree **and recommended build order** |
+| `ACCEPTANCE.md` | Acceptance-criteria rollup + coverage-gap table |
+| `specs/<NNNN>-<feature>.md` | One self-contained, self-testing feature spec (exact behavior, I/O, edge cases, errors, acceptance criteria) |
+| `adr/<NNNN>-<decision>.md` | One MADR-style Architecture Decision Record per significant decision (status `Reconstructed`) |
+| `RISKS-AND-GAPS.md` | Unverified claims, thin coverage, `[INFERRED]` misuse, open questions |
 
 ## How it works
 
-A single dynamic Workflow (`workflows/portkit.js`) runs six phases, fanning out fresh-context
+A single dynamic Workflow (`workflows/portkit.js`) runs these phases, fanning out fresh-context
 specialist agents:
 
-1. **Map** — survey the repo, draft the capability/epic inventory.
-2. **Discover slices** — per epic, trace each capability end-to-end into fine vertical slices, then
-   extract the behavioral acceptance spec from the existing tests (pipelined per epic).
-3. **Synthesize** — normalize/dedup overlapping slices, decide the kernel/slice boundary, write the
-   kernel + index, compute the topological build order.
-4. **Write slices** — one self-contained, self-testing slice doc per unit.
-5. **Target mapping** — per target: dependency map, porting hazards, prescriptive per-slice hints.
+1. **Map** — survey the repo, draft the capability inventory (data only; no file written).
+2. **Discover slices** — per capability, trace each behavior end-to-end into fine features, then
+   extract the behavioral acceptance spec from the existing tests.
+3. **Synthesize** — normalize/dedup overlapping features, compute the topological build order, and
+   author the system-wide docs (PRD, ARCHITECTURE, INDEX, ACCEPTANCE).
+4. **ADRs** — discover architecturally significant decisions (each with `path:line` evidence), write
+   one MADR-style ADR each.
+5. **Write specs** — one self-contained, self-testing feature spec per unit.
 6. **Critic** — grounding + completeness audit → `RISKS-AND-GAPS.md`, with a budget-bounded gap-fill
    loop.
 
 ### Tuning knobs (optional `args`)
 
-`inputDir` (default `.`), `outputDir` (default `<inputDir>/<target-language>`, or
-`<inputDir>/.portkit` if no target), `maxEpics` (40), `maxHintsPerTarget` (80),
-`maxGapfillRounds` (2), `maxAgents` (1000, the over-scale guard's per-run ceiling), `resume`
-(internal — set automatically on a continued over-scale pass). (`sourcePath`/`outDir` are accepted as
-legacy aliases for `inputDir`/`outputDir`.) **Slices are never capped** — they are the deliverable,
-so dropping them is never an option; genuine over-scale is handled by epic-partitioned resumable
-passes (see below). The remaining caps exist because the Workflow runtime limits a run to ~1000
-agents; anything capped is **logged and recorded in the result's `truncations`** — silent truncation
-would read as "complete" when it isn't.
+`inputDir` (default `.`), `outputDir` (default `<inputDir>_recreation`), `maxEpics` (40), `maxAdrs`
+(12), `maxGapfillRounds` (2), `maxConcurrency` (8), `checkpointEvery` (default `maxConcurrency` —
+capabilities analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
+ceiling), `fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
+auto-resume is the normal path). (`sourcePath`/`outDir` are accepted as legacy aliases for
+`inputDir`/`outputDir`.) **Features are never capped** — they are the deliverable, so dropping them is
+never an option; genuine over-scale is handled by capability-partitioned resumable passes (see
+below). The remaining caps exist because the Workflow runtime limits a run to ~1000 agents; anything
+capped is **logged and recorded in the result's `truncations`** — silent truncation would read as
+"complete" when it isn't.
 
-### Over-scale: partition, never truncate
+### Resumability: checkpoint every stage, resume anywhere
 
-If a single run's projected agent count would approach the runtime's ~1000-agent ceiling, PortKit
-runs map/discover/**synthesize once**, persists the synthesized IR under `<outputDir>/.portkit/`,
-then writes slice docs in **epic-batched passes**. The run returns `resumeRequired: true` with
-`resumeArgs`; re-invoking with those args drains the next batch against the same `outputDir` until
-every slice is written. Synthesis (and the shared kernel) is computed exactly once, so the build kit
-stays coherent across passes and **no slice is ever dropped**.
+PortKit persists a checkpoint to `<outputDir>/.portkit/ir.json` after **every stage** — map, each
+discovery batch (`checkpointEvery` capabilities), synthesis, the doc family, ADRs, and each
+feature-spec write pass. If a run is interrupted (crash, timeout, spend limit, API outage),
+**re-running the same command auto-resumes** from the last completed stage rather than reprocessing —
+the expensive per-capability discovery is preserved batch by batch, so a large project never starts
+over. The checkpoint is fingerprinted by `source`, so one for a different input dir is ignored (never
+a wrong-codebase resume), and it is deleted when the run completes. Pass `--fresh` to ignore an
+existing checkpoint.
+
+Two things stay stable across a resume so the kit remains coherent: the synthesized build order (and
+its `#NNNN` numbering) and the discovered ADR set are computed once and reloaded, so feature specs
+already written keep matching their numbers.
+
+**Over-scale** is the same machinery taken further: if a single run's projected agent count would
+approach the runtime's ~1000-agent ceiling, the analysis + doc family + ADRs run once and feature
+specs are written in **capability-batched passes**, returning `resumeRequired: true` until every
+feature is written. **No feature is ever dropped.**
 
 ## Design constraints baked in
 
-- **Grounding is mandatory** — every nontrivial claim cites `path:line`; unverifiable claims are
-  marked `[UNVERIFIED]`, not asserted.
-- **Neutral core / target layer separation** — the core is reusable across multiple targets.
+- **Grounding is mandatory** — every nontrivial claim about the source cites `path:line`;
+  unverifiable claims are marked `[UNVERIFIED]`, not asserted.
+- **Inference is inverted and tagged** — reverse-engineering yields *intent* (PRD goals/non-goals/
+  metrics, ADR rationale/"why") that the source does not state; every such statement is tagged
+  `[INFERRED]` and never presented as observed fact.
 - **Tests are the behavioral contract** — thin/missing coverage is flagged loudly, never hidden.
-- **Non-portable deps become explicit human-decision items**, not silent guesses.
+- **ADRs require evidence** — a decision with no observable `path:line` support is not recorded.
 
 See `VERIFICATION.md` for how to validate the plugin and the docs it produces.

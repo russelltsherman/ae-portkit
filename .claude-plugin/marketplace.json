@@ -1,6 +1,6 @@
 {
   "name": "ae-portkit",
-  "description": "Russell Sherman's portkit plugin: analyze a codebase into a target-neutral, vertical-slice build kit for porting.",
+  "description": "Russell Sherman's portkit plugin: reverse-engineer a codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs).",
   "owner": {
     "name": "Russell Sherman",
     "url": "https://github.com/russelltsherman"
@@ -9,7 +9,7 @@
     {
       "name": "portkit",
       "source": "./src/portkit",
-      "description": "Analyze a codebase into a target-neutral, vertical-slice build kit so a weaker downstream model can recreate the project in a different language or framework."
+      "description": "Reverse-engineer a codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs, acceptance criteria) so a weaker downstream model can recreate it from the docs alone."
     }
   ]
 }

@@ -1,8 +1,9 @@
 # ae-portkit
 
-A Claude Code plugin marketplace (`ae-portkit`) exposing the `portkit` plugin: analyze a codebase
-into a **target-neutral, vertical-slice build kit** so a weaker downstream model can recreate the
-project in a different language or framework from the documents alone.
+A Claude Code plugin marketplace (`ae-portkit`) exposing the `portkit` plugin: reverse-engineer a
+codebase into a **stack-neutral recreation kit** — a PRD, an architecture spec, per-feature specs,
+ADRs, and acceptance criteria — so a weaker downstream model can recreate the software from the
+documents alone.
 
 ## Install
 

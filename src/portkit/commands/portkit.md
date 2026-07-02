@@ -1,35 +1,31 @@
 ---
-description: Analyze this codebase into a target-neutral, vertical-slice build kit for porting to another language/framework.
-argument-hint: <target-lang> [input-dir] [--input <dir>] [--output <dir>]
+description: Analyze this codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs, acceptance criteria) a weaker model can rebuild from.
+argument-hint: [input-dir] [--input <dir>] [--output <dir>] [--fresh]
 allowed-tools: Bash, Workflow
 ---
 
 # /portkit
 
 Run the **PortKit** workflow: a team of specialist agents deeply analyzes a codebase and emits a
-collection of planning documents — organized as small, self-contained, self-testing **vertical
-slices** — so a *less capable local model* can recreate the project in a different language or
-framework from the docs alone.
+family of standard planning/design documents — a **PRD**, an **architecture/technical spec**,
+one **feature spec** per capability, **ADRs** for the significant decisions, and **acceptance
+criteria** — detailed enough that a *less capable local model* can recreate the software **from the
+docs alone**. The output is **stack-neutral**: it describes the software to rebuild, not a port to a
+specific target language.
 
 ## Arguments
 
 Raw arguments: `$ARGUMENTS`
 
-Parse them as: `<target-lang> [input-dir] [--input <dir>] [--output <dir>]`
+Parse them as: `[input-dir] [--input <dir>] [--output <dir>]`
 
-- **target-lang** (optional but recommended): a single target language/framework (e.g. `go`, `rust`,
-  `typescript`). It gets a prescriptive mapping layer under `targets/<lang>/`. If omitted, produce
-  only the target-neutral core. (One target per run — to cover several, run again with the same
-  `--output` and the neutral core is reused.)
 - **input dir** — the codebase root to analyze. Provide it either as the positional `[input-dir]`
   or via `--input <dir>` (the flag wins if both are given). Defaults to the current directory (`.`).
 - **`--output <dir>`** (optional): where to write the generated docs. Defaults to a **sibling** of
-  the input dir named `<input-dir>_<target>` (e.g. `/src/mulch` → `/src/mulch_rust`), or
-  `<input-dir>_portkit` if no target. Output is never nested inside the input dir, so it does not
-  pollute the source tree.
+  the input dir named `<input-dir>_recreation` (e.g. `/src/mulch` → `/src/mulch_recreation`).
+  Output is never nested inside the input dir, so it does not pollute the source tree.
 
-When a path could be confused with a target language, prefer the explicit `--input` / `--output`
-flags.
+When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
 
 ## Steps
 
@@ -42,50 +38,71 @@ flags.
    - persistently in `.claude/settings.local.json`: `{ "env": { "CLAUDE_CODE_WORKFLOWS": "1" } }`
 
 2. **Build the args object** from the parsed arguments:
-   - `target`: the single target language (omit if none given).
    - `inputDir`: the resolved input dir (`--input` flag, else positional `[input-dir]`, else `"."`).
    - `outputDir`: the `--output` value if given; otherwise omit it and let the workflow default to
-     `<inputDir>/<target-language>` (`<inputDir>/.portkit` if no target).
-   - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`,
-     `maxHintsPerTarget`, `maxGapfillRounds`, `maxConcurrency` (max agents in flight at once;
-     defaults to `8` — lower it if the run is being API-rate-limited/throttled, raise it to go faster
-     on an account with generous limits), and `maxAgents` (the per-run agent ceiling used for the
-     over-scale guard; defaults to `1000` — the runtime's hard cap).
-   - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N slices (in
-     build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize → write →
-     target → critic) cheaply. The output is a **partial, self-consistent TEST kit** — reported
-     loudly (`counts.testLimited`, `counts.slicesOmittedForTest`, and a `🧪 TEST LIMIT` truncation)
-     and **never a complete port plan**. For the cheapest end-to-end smoke test, pair it with a low
-     `maxEpics` to also cut discovery cost, e.g. `{ maxEpics: 2, limitSlices: 3 }`.
+     `<inputDir>_recreation`.
+   - `fresh: true` (from `--fresh`): ignore any existing checkpoint at the output dir and reprocess
+     from scratch (see **Resuming** below). Omit it for the normal auto-resume behavior.
+   - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`, `maxAdrs`
+     (cap on discovered ADRs; defaults to `12`), `maxGapfillRounds`, `maxConcurrency` (max agents in
+     flight at once; defaults to `8` — lower it if the run is being API-rate-limited/throttled, raise
+     it to go faster on an account with generous limits), `checkpointEvery` (capabilities analyzed
+     per discovery checkpoint; defaults to `maxConcurrency` — lower it to checkpoint more often on a
+     flaky connection), and `maxAgents` (the per-run agent ceiling used for the over-scale guard;
+     defaults to `1000` — the runtime's hard cap).
+   - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N feature specs
+     (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
+     adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —
+     reported loudly (`counts.testLimited`, `counts.slicesOmittedForTest`, and a `🧪 TEST LIMIT`
+     truncation) and **never a complete recreation kit**. For the cheapest end-to-end smoke test,
+     pair it with a low `maxEpics` to also cut discovery cost, e.g. `{ maxEpics: 2, limitSlices: 3 }`.
 
 3. **Invoke the workflow** with the `Workflow` tool, pointing `scriptPath` at the bundled script and
    passing the args object:
    ```
    Workflow({
      scriptPath: "${CLAUDE_PLUGIN_ROOT}/workflows/portkit.js",
-     args: { target: "rust", inputDir: "...", outputDir: "..." }
+     args: { inputDir: "...", outputDir: "..." }
    })
    ```
    The workflow runs in the background; watch it live with `/workflows`.
 
 4. **When it completes**, check `resumeRequired` first:
    - If `resumeRequired` is `true`, the codebase was large enough that the workflow partitioned
-     slice-writing into resumable passes (no slices are dropped). It returns `resumeArgs` (e.g.
-     `{ resume: true, outputDir: "<dir>", target: "<lang>" }`). **Re-invoke the workflow with those
-     args**, and keep re-invoking until `resumeRequired` is `false`. Each pass writes the next batch
-     of slice docs against the same `outputDir`. Report progress (`slicesWritten` / `slicesRemaining`)
-     between passes.
+     feature-spec writing into resumable passes (nothing is dropped). It returns `resumeArgs` (e.g.
+     `{ resume: true, outputDir: "<dir>" }`). **Re-invoke the workflow with those args** (or just
+     re-run the same command — it auto-resumes; see **Resuming**), and keep re-invoking until
+     `resumeRequired` is `false`. Each pass writes the next batch of feature specs against the same
+     `outputDir`. Report progress (`slicesWritten` / `slicesRemaining`) between passes.
    - When `resumeRequired` is `false`, report the final summary: where the docs were written
-     (`outDir`), the slice counts, any **truncations** (real coverage gaps — surface them), and the
-     **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human must resolve
-     (e.g. dependencies with no clean target equivalent).
+     (`outDir`), the feature/ADR counts, any **truncations** (real coverage gaps — surface them),
+     and the **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human
+     must resolve.
+   - If the run is **interrupted** (crash, timeout, spend limit, API outage), just re-run the same
+     command: it checkpoints after every stage and resumes from where it stopped (see **Resuming**).
+
+## Resuming
+
+PortKit checkpoints its progress to `<output>/.portkit/ir.json` after every stage — map, each
+discovery batch, synthesis, the doc family, ADRs, and each feature-spec write pass. If a run is
+interrupted anywhere, **re-running the same command auto-resumes** from the last completed stage
+instead of reprocessing: the expensive per-capability discovery, in particular, is preserved batch
+by batch. The checkpoint is fingerprinted by the input dir, so a checkpoint for a different source is
+ignored (never a wrong-codebase resume), and it is deleted automatically when the run completes.
+
+- `--fresh` — ignore any existing checkpoint and reprocess from scratch (use after the source
+  changed, or to regenerate a completed kit).
+- `resume: true` — demand a checkpoint and continue it; errors if none exists (auto-resume is the
+  normal path, so you rarely need this explicitly).
+- `checkpointEvery` — capabilities analyzed per discovery checkpoint (default `maxConcurrency`).
 
 ## Notes
 
-- Output lands in the sibling dir `<input-dir>_<target-language>/` by default (or
-  `<input-dir>_portkit/` with no target), never inside the input dir. The **neutral core** (system
-  map, kernel, vertical-slice docs, build-order index,
-  behavioral spec) is reusable across targets; each `targets/<lang>/` layer is additive and
-  prescriptive. To cover several targets, run again pointed at the same `--output`: the neutral core
-  is reused and only the new `targets/<lang>/` layer is added.
+- Output lands in the sibling dir `<input-dir>_recreation/` by default, never inside the input dir.
+  The kit is **stack-neutral** — a PRD, an architecture spec, per-feature specs, MADR-style ADRs,
+  and an acceptance-criteria rollup — so it describes what to rebuild without prescribing a target
+  language.
+- **Grounding vs. inference:** observed facts cite `path:line`; reverse-engineered *intent* (PRD
+  goals/non-goals/success metrics, ADR rationale/"why") is tagged `[INFERRED]` — never presented as
+  observed fact.
 - This command produces **documents only** — it does not perform the recreation.

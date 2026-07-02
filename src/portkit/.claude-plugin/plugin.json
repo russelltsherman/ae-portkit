@@ -1,17 +1,20 @@
 {
   "name": "portkit",
-  "description": "Analyze a codebase into a target-neutral, vertical-slice build kit so a weaker downstream model can recreate the project in a different language or framework.",
-  "version": "0.1.1",
+  "description": "Reverse-engineer a codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs, acceptance criteria) so a weaker downstream model can recreate it from the docs alone.",
+  "version": "0.3.0",
   "author": {
     "name": "Russell Sherman",
     "url": "https://github.com/russelltsherman"
   },
   "keywords": [
-    "porting",
-    "migration",
+    "reverse-engineering",
     "codebase-analysis",
+    "recreation",
     "planning",
-    "vertical-slices",
+    "prd",
+    "architecture",
+    "adr",
+    "resumable",
     "workflow"
   ]
 }

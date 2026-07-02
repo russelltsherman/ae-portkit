@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -255,23 +255,29 @@ test('portkit.js does not silently truncate the slice list (limitSlices stays op
 })
 
 // --- projectAgents -----------------------------------------------------------
-test('projectAgents: neutral-core run (no target) sums the fan-out', () => {
+test('projectAgents: base run (no ADRs) sums the fan-out', () => {
   const { projectAgents } = loadDeterministic()
-  // fixed 6 + 2*epics + slices + 0 target + gapfill
-  assert.equal(projectAgents({ epicCount: 4, sliceCount: 20, hasTarget: false, gapfillRounds: 2 }), 6 + 8 + 20 + 0 + 2)
+  // fixed 9 + 2*epics + slices + 0 adrs + gapfill
+  assert.equal(projectAgents({ epicCount: 4, sliceCount: 20, gapfillRounds: 2 }), 9 + 8 + 20 + 0 + 2)
 })
 
-test('projectAgents: target run adds deps + capped hints', () => {
+test('projectAgents: ADR fan-out adds min(adrCount, maxAdrs)', () => {
   const { projectAgents } = loadDeterministic()
-  // hints capped at hintCap=80, sliceCount=200 -> 1 + 80
-  assert.equal(projectAgents({ epicCount: 10, sliceCount: 200, hasTarget: true, hintCap: 80, gapfillRounds: 2 }),
-    6 + 20 + 200 + (1 + 80) + 2)
+  // adrCount 30 exceeds maxAdrs 12 -> only 12 ADR writers counted
+  assert.equal(projectAgents({ epicCount: 10, sliceCount: 200, adrCount: 30, maxAdrs: 12, gapfillRounds: 2 }),
+    9 + 20 + 200 + 12 + 2)
 })
 
-test('projectAgents: grows ~1 per slice (write phase dominates)', () => {
+test('projectAgents: ADR term is bounded by maxAdrs (fewer ADRs than the cap)', () => {
   const { projectAgents } = loadDeterministic()
-  const base = projectAgents({ epicCount: 5, sliceCount: 100, hasTarget: false })
-  const more = projectAgents({ epicCount: 5, sliceCount: 101, hasTarget: false })
+  // adrCount 3 is under the cap -> exactly 3 ADR writers counted
+  assert.equal(projectAgents({ epicCount: 0, sliceCount: 0, adrCount: 3, maxAdrs: 12 }), 9 + 0 + 0 + 3 + 0)
+})
+
+test('projectAgents: grows ~1 per feature (write phase dominates)', () => {
+  const { projectAgents } = loadDeterministic()
+  const base = projectAgents({ epicCount: 5, sliceCount: 100 })
+  const more = projectAgents({ epicCount: 5, sliceCount: 101 })
   assert.equal(more - base, 1)
 })
 
@@ -313,60 +319,55 @@ test('planEpicBatches: partitions cover every slice exactly once (no drops)', ()
 // Normalizes the workflow's `args` input (object / JSON string / CLI string /
 // missing) into a structured config. The CLI-string branch is the regression
 // fix: when the slash-command bridge forwards the RAW argument string verbatim
-// (e.g. "go --input /src/mulch") instead of a built object, parsing must still
-// recover inputDir/target — otherwise the run drifts to SOURCE="." (cwd).
+// (e.g. "--input /src/mulch" or just "/src/mulch") instead of a built object,
+// parsing must still recover inputDir — otherwise the run drifts to SOURCE="."
+// (cwd). This is a STACK-NEUTRAL kit: there is no target-language argument.
 
 test('parseArgs: object passed through unchanged (happy path)', () => {
   const { parseArgs } = loadDeterministic()
-  const o = { inputDir: '/src/mulch', target: 'go', outputDir: '/out' }
+  const o = { inputDir: '/src/mulch', outputDir: '/out' }
   assert.equal(parseArgs(o), o) // same reference — no copy, no mangling
 })
 
 test('parseArgs: JSON object string is parsed', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('{"inputDir":"/src/mulch","target":"go"}'),
-    { inputDir: '/src/mulch', target: 'go' })
+  assert.deepEqual(parseArgs('{"inputDir":"/src/mulch","outputDir":"/out"}'),
+    { inputDir: '/src/mulch', outputDir: '/out' })
 })
 
-test('parseArgs: regression — raw CLI string "<target> --input <dir>"', () => {
+test('parseArgs: regression — raw CLI string "--input <dir>"', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('go --input /Users/x/reference/mulch'),
-    { target: 'go', inputDir: '/Users/x/reference/mulch' })
+  assert.deepEqual(parseArgs('--input /Users/x/reference/mulch'),
+    { inputDir: '/Users/x/reference/mulch' })
 })
 
-test('parseArgs: positional target + positional input dir', () => {
+test('parseArgs: sole positional is the input dir', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('rust /src/mulch'),
-    { target: 'rust', inputDir: '/src/mulch' })
+  assert.deepEqual(parseArgs('/src/mulch'), { inputDir: '/src/mulch' })
 })
 
 test('parseArgs: --input flag wins over positional input dir', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('go /positional --input /flagged'),
-    { target: 'go', inputDir: '/flagged' })
+  assert.deepEqual(parseArgs('/positional --input /flagged'),
+    { inputDir: '/flagged' })
 })
 
 test('parseArgs: --output and its aliases map to outputDir', () => {
   const { parseArgs } = loadDeterministic()
-  assert.equal(parseArgs('go --output /a').outputDir, '/a')
-  assert.equal(parseArgs('go --out /b').outputDir, '/b')
-  assert.equal(parseArgs('go --outputDir /c').outputDir, '/c')
+  assert.equal(parseArgs('/m --output /a').outputDir, '/a')
+  assert.equal(parseArgs('/m --out /b').outputDir, '/b')
+  assert.equal(parseArgs('/m --outputDir /c').outputDir, '/c')
 })
 
 test('parseArgs: --flag=value form', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('go --input=/src/mulch --output=/out'),
-    { target: 'go', inputDir: '/src/mulch', outputDir: '/out' })
+  assert.deepEqual(parseArgs('--input=/src/mulch --output=/out'),
+    { inputDir: '/src/mulch', outputDir: '/out' })
 })
 
 test('parseArgs: unknown tuning knobs pass through (camelCase preserved)', () => {
   const { parseArgs } = loadDeterministic()
-  assert.equal(parseArgs('go --input /m --maxEpics 50').maxEpics, '50')
-})
-
-test('parseArgs: --target flag wins over positional', () => {
-  const { parseArgs } = loadDeterministic()
-  assert.equal(parseArgs('/src/mulch --target go').target, 'go')
+  assert.equal(parseArgs('--input /m --maxAdrs 20').maxAdrs, '20')
 })
 
 test('parseArgs: empty / missing / non-string-non-object -> {}', () => {
@@ -378,9 +379,71 @@ test('parseArgs: empty / missing / non-string-non-object -> {}', () => {
   assert.deepEqual(parseArgs(42), {})
 })
 
-test('parseArgs: bare target only', () => {
+test('parseArgs: bare positional only', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('go'), { target: 'go' })
+  assert.deepEqual(parseArgs('some-dir'), { inputDir: 'some-dir' })
+})
+
+// --- stageDone (checkpoint ladder) ------------------------------------------
+test('stageDone: fresh run (unknown/undefined stage) has done nothing', () => {
+  const { stageDone } = loadDeterministic()
+  assert.equal(stageDone(undefined, 'mapped'), false)
+  assert.equal(stageDone(null, 'writing'), false)
+  assert.equal(stageDone('bogus', 'mapped'), false)
+})
+
+test('stageDone: a saved stage counts itself and all earlier stages as done', () => {
+  const { stageDone } = loadDeterministic()
+  assert.equal(stageDone('synthesized', 'mapped'), true)
+  assert.equal(stageDone('synthesized', 'discovered'), true)
+  assert.equal(stageDone('synthesized', 'synthesized'), true)
+})
+
+test('stageDone: later stages are NOT done', () => {
+  const { stageDone } = loadDeterministic()
+  assert.equal(stageDone('mapped', 'discovered'), false)
+  assert.equal(stageDone('discovered', 'writing'), false)
+})
+
+test('stageDone: partial discovery is not complete discovery', () => {
+  const { stageDone } = loadDeterministic()
+  assert.equal(stageDone('discovering', 'mapped'), true) // map is done
+  assert.equal(stageDone('discovering', 'discovered'), false) // discovery is not
+})
+
+test('stageDone: an unknown target is never satisfied', () => {
+  const { stageDone } = loadDeterministic()
+  assert.equal(stageDone('writing', 'bogus'), false)
+})
+
+// --- chunk -------------------------------------------------------------------
+test('chunk: splits into fixed-size, order-preserving groups', () => {
+  const { chunk } = loadDeterministic()
+  assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])
+})
+
+test('chunk: exact multiple splits evenly', () => {
+  const { chunk } = loadDeterministic()
+  assert.deepEqual(chunk([1, 2, 3, 4], 2), [[1, 2], [3, 4]])
+})
+
+test('chunk: empty input -> no groups', () => {
+  const { chunk } = loadDeterministic()
+  assert.deepEqual(chunk([], 3), [])
+})
+
+test('chunk: non-positive size -> a single group (or none when empty)', () => {
+  const { chunk } = loadDeterministic()
+  assert.deepEqual(chunk([1, 2, 3], 0), [[1, 2, 3]])
+  assert.deepEqual(chunk([], 0), [])
+})
+
+test('chunk: covers every item exactly once (no drops)', () => {
+  const { chunk } = loadDeterministic()
+  const items = Array.from({ length: 37 }, (_, i) => i)
+  const flat = chunk(items, 8).flat()
+  assert.equal(flat.length, 37)
+  assert.deepEqual(flat, items)
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only
