@@ -444,6 +444,33 @@ function findSourceCitations(text) {
   const re = new RegExp('`?' + PATH + ':' + LINES + '`?', 'g')
   return String(text).match(re) || []
 }
+
+// planResume — PURE. Decide, from the per-capability side-car scan, what each capability
+// needs on RESUME. The analyzed source is STATIC, so its slice decomposition is a FIXED
+// target: a capability's slice STRUCTURE (light.json) is a deterministic function of the
+// source and, once written, DURABLE — it must be RELOADED, never re-discovered. Re-running
+// discovery would produce a different slice set and RENUMBER every downstream spec, turning
+// a resume into a duplicate rewrite (the exact bug this guards against). behavior.json is a
+// DOWNSTREAM artifact (test-derived acceptance criteria); when it ALONE is missing we re-run
+// ONLY the behavior agent against the reloaded slices — structure and numbering untouched.
+// Returns { reload, behaviorOnly, discover } as epic-id arrays in `epics` order:
+//   - reload:       has light.json                  -> reload slices (structure is fixed)
+//   - behaviorOnly: reload ∩ missing behavior.json  -> behavior re-run only (no re-discovery)
+//   - discover:     no light.json                   -> full discovery (never analyzed yet)
+function planResume(epics, scan) {
+  const byId = new Map((scan || []).map(e => [e && e.id, e]))
+  const reload = [], behaviorOnly = [], discover = []
+  for (const e of (epics || [])) {
+    const s = byId.get(e.id)
+    if (s && s.hasLight) {
+      reload.push(e.id)
+      if (!s.hasBehavior) behaviorOnly.push(e.id)
+    } else {
+      discover.push(e.id)
+    }
+  }
+  return { reload, behaviorOnly, discover }
+}
 // </portkit:deterministic>
 
 // Bounded-concurrency fan-out. Same contract as parallel() — order-stable, never
@@ -824,12 +851,33 @@ async function writeSliceDocs(sliceList) {
   return written
 }
 
+// runBehaviorSpec — extract each slice's behavioral acceptance spec from the source's
+// tests and WRITE the behavior side-car. Deliberately SEPARATE from discovery so a resume
+// can fill a MISSING behavior spec against ALREADY-DISCOVERED slices (reloaded from
+// light.json) WITHOUT re-discovering — and thus renumbering — the slice set. `slices` carry
+// at least { id, name, capability }; a capability with no slices needs no behavior side-car.
+async function runBehaviorSpec(epicId, slices, sysFacts) {
+  const ids = (slices || []).map(s => ({ id: s.id, name: s.name, capability: s.capability }))
+  if (ids.length === 0) return
+  await agent(
+    `You are the PortKit BEHAVIOR-SPEC agent. The source's existing tests are the behavioral contract.\n\n` +
+    `Source root: \`${SOURCE}\`. Test setup: ${sysFacts}\n\n` +
+    `For each slice below, find the source tests that exercise it and translate them into LANGUAGE-NEUTRAL ` +
+    `acceptance criteria (concrete enough that a weak model can self-check its rebuild). Cite each source test ` +
+    `as \`path:line\`. Rate coverage good/thin/none. FLAG thin/none LOUDLY — never paper over missing coverage.\n\n` +
+    `WRITE the result as JSON \`{ "perSlice": [ { "sliceId", "coverage", "acceptanceCriteria": [...], "testRefs": [...] } ] }\` ` +
+    `to \`${behaviorCarPath(epicId)}\` (create parent directories first). This side-car is read later by the ` +
+    `ACCEPTANCE and feature-spec writers — write the file, do not just return.\n\n` +
+    `SLICES:\n${JSON.stringify(ids, null, 2)}\n\n${GROUND_RULE}\n\nReturn perSlice behavioral specs.`,
+    { schema: BEHAVIOR, phase: 'Discover slices', label: `behavior:${epicId}` }
+  )
+}
+
 // Discover ONE capability end-to-end: trace it into fine vertical slices (features),
 // then extract each slice's behavioral acceptance spec from the test suite. Returns
-// { epicId, slices, behavior } — or null if the discovery agent itself failed, so a
-// failed capability is retried on the next resume rather than silently lost. A
-// capability that legitimately has no slices returns { epicId, slices: [] } (done,
-// not retried).
+// { epicId, slices } — or null if the discovery agent itself failed, so a failed
+// capability is retried on the next resume rather than silently lost. A capability that
+// legitimately has no slices returns { epicId, slices: [] } (done, not retried).
 async function discoverEpic(epic, sysFacts) {
   const r = await agent(
     `You are the PortKit SLICE-DISCOVERY agent for ONE capability of the source at \`${SOURCE}\`.\n\n` +
@@ -851,26 +899,14 @@ async function discoverEpic(epic, sysFacts) {
   )
   const prev = r ? { epicId: epic.id, slices: r.slices || [] } : null
   if (!prev || prev.slices.length === 0) return prev
-  const ids = prev.slices.map(s => ({ id: s.id, name: s.name, capability: s.capability }))
-  await agent(
-    `You are the PortKit BEHAVIOR-SPEC agent. The source's existing tests are the behavioral contract.\n\n` +
-    `Source root: \`${SOURCE}\`. Test setup: ${sysFacts}\n\n` +
-    `For each slice below, find the source tests that exercise it and translate them into LANGUAGE-NEUTRAL ` +
-    `acceptance criteria (concrete enough that a weak model can self-check its rebuild). Cite each source test ` +
-    `as \`path:line\`. Rate coverage good/thin/none. FLAG thin/none LOUDLY — never paper over missing coverage.\n\n` +
-    `WRITE the result as JSON \`{ "perSlice": [ { "sliceId", "coverage", "acceptanceCriteria": [...], "testRefs": [...] } ] }\` ` +
-    `to \`${behaviorCarPath(epic.id)}\` (create parent directories first). This side-car is read later by the ` +
-    `ACCEPTANCE and feature-spec writers — write the file, do not just return.\n\n` +
-    `SLICES:\n${JSON.stringify(ids, null, 2)}\n\n${GROUND_RULE}\n\nReturn perSlice behavioral specs.`,
-    { schema: BEHAVIOR, phase: 'Discover slices', label: `behavior:${epic.id}` }
-  )
   // LIGHT per-epic result ONLY — the bulky thread + acceptance criteria live in the
-  // side-cars written above, never in the checkpoint (that is what kept persist small
-  // enough to succeed). Downstream heavy consumers read the side-cars from disk.
+  // side-cars (written by the discovery + behavior agents), never in the checkpoint
+  // (that is what kept persist small enough to succeed). Heavy consumers read from disk.
   const lightSlices = prev.slices.map((s) => ({
     id: s.id, name: s.name, capability: s.capability,
     behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [],
   }))
+  await runBehaviorSpec(epic.id, lightSlices, sysFacts)
   return { epicId: epic.id, slices: lightSlices }
 }
 
@@ -1002,18 +1038,26 @@ async function clearIR() {
 }
 // Resume helpers — completion is judged by the DURABLE ARTIFACTS on disk, not by the
 // checkpoint, so no already-finished agent is ever re-run even if the checkpoint lagged.
-// listDoneEpics: which capabilities already have BOTH their light + behavior side-cars
-// (i.e. discovery finished for them). loadEpicLight: rebuild ONE capability's light
-// slice list from its small light.json (a small read, never the heavy slices.json).
-async function listDoneEpics() {
+// scanEpicSidecars: for EACH capability under EPICS_DIR, which side-cars exist. Slice
+// STRUCTURE (light.json) and the BEHAVIOR spec (behavior.json) are INDEPENDENT artifacts —
+// reporting them separately (rather than a single "both present = done" flag) lets
+// planResume() reload durable structure and re-run ONLY a missing behavior spec, instead of
+// re-discovering (and renumbering) a capability just because its behavior agent had failed.
+// loadEpicLight: rebuild ONE capability's light slice list from its small light.json
+// (a small read, never the heavy slices.json).
+async function scanEpicSidecars() {
   const r = await agent(
-    `You are the PortKit RESUME-SCAN agent. List \`${EPICS_DIR}\` (it may not exist — then return \`{"epicIds": []}\`). ` +
-    `A capability is DONE only if BOTH \`<id>.light.json\` AND \`<id>.behavior.json\` are present. Return ` +
-    `\`{"epicIds": [<id> for each done capability]}\` — the id is the file name with the \`.light.json\` suffix removed.`,
-    { schema: { type: 'object', properties: { epicIds: { type: 'array', items: { type: 'string' } } } },
+    `You are the PortKit RESUME-SCAN agent. List \`${EPICS_DIR}\` (it may not exist — then return \`{"epics": []}\`). ` +
+    `A capability id is a side-car file name with its \`.light.json\`, \`.slices.json\`, or \`.behavior.json\` suffix ` +
+    `removed. For EVERY distinct capability id present, report which side-cars exist. Return ` +
+    `\`{"epics": [ { "id": <id>, "hasLight": <true iff <id>.light.json exists>, "hasBehavior": <true iff <id>.behavior.json exists> } ]}\`.`,
+    { schema: { type: 'object', properties: { epics: { type: 'array', items: {
+        type: 'object',
+        properties: { id: { type: 'string' }, hasLight: { type: 'boolean' }, hasBehavior: { type: 'boolean' } },
+        required: ['id', 'hasLight', 'hasBehavior'] } } } },
       phase: 'Discover slices', label: 'resume:scan' }
   )
-  return (r && Array.isArray(r.epicIds)) ? r.epicIds : []
+  return (r && Array.isArray(r.epics)) ? r.epics : []
 }
 async function loadEpicLight(epicId) {
   const r = await agent(
@@ -1284,11 +1328,23 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
 // identical to a fresh run, keeping already-written spec file names valid.
 let perEpicDone = []
 if (RESUMING && stageDone(savedStage, 'mapped')) {
-  const doneSet = new Set(await listDoneEpics())
-  const doneInOrder = epics.filter(e => doneSet.has(e.id)).map(e => e.id)
-  if (doneInOrder.length) {
-    perEpicDone = (await pooled(doneInOrder.map(id => () => loadEpicLight(id)))).filter(Boolean)
-    log(`Reusing ${perEpicDone.length} capability(ies) already analyzed by a prior run (from side-cars).`)
+  const plan = planResume(epics, await scanEpicSidecars())
+  if (plan.reload.length) {
+    // Structure is durable + deterministic: reload EVERY capability that has a light.json
+    // (in `epics` order, so numbering matches a fresh run) — NEVER re-discover it, which
+    // would change the slice set and renumber every downstream spec.
+    perEpicDone = (await pooled(plan.reload.map(id => () => loadEpicLight(id)))).filter(Boolean)
+    // A capability whose behavior side-car is missing (its behavior agent failed on a prior
+    // pass) re-runs ONLY the behavior agent, against the reloaded slices — structure and
+    // numbering are untouched, so already-written specs keep matching their build numbers.
+    const fill = new Set(plan.behaviorOnly)
+    const behaviorTodo = perEpicDone.filter(e => e && e.slices.length && fill.has(e.epicId))
+    if (behaviorTodo.length) {
+      log(`Reusing ${perEpicDone.length} capability(ies) from durable side-cars (structure unchanged); re-running behavior-spec only for ${behaviorTodo.length} missing a behavior side-car.`)
+      await pooled(behaviorTodo.map(e => () => runBehaviorSpec(e.epicId, e.slices, sysFacts)))
+    } else {
+      log(`Reusing ${perEpicDone.length} capability(ies) already analyzed by a prior run (from side-cars).`)
+    }
   }
 }
 if (!(RESUMING && stageDone(savedStage, 'discovered'))) {

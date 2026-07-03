@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations', 'planResume']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -554,6 +554,82 @@ test('findSourceCitations: does NOT match artifact paths, tags, or ratios (kept 
 test('findSourceCitations: none in already-clean prose', () => {
   const { findSourceCitations } = loadDeterministic()
   assert.deepEqual(findSourceCitations('The config is a YAML map keyed by domain name. `[INFERRED]` intent.'), [])
+})
+
+// --- planResume (resume decision core) --------------------------------------
+// The static source has a FIXED slice decomposition, so a resume must RELOAD durable
+// structure (light.json), never re-discover it — re-discovery changes the slice set and
+// renumbers every downstream spec (the duplicate-rewrite bug). A missing behavior.json
+// ALONE triggers a behavior-only re-run, not re-discovery.
+const ep = (id) => ({ id })
+
+test('planResume: light-only capabilities are RELOADED, never re-discovered', () => {
+  const { planResume } = loadDeterministic()
+  const scan = [{ id: 'a', hasLight: true, hasBehavior: true }, { id: 'b', hasLight: true, hasBehavior: true }]
+  const plan = planResume([ep('a'), ep('b')], scan)
+  assert.deepEqual(plan.reload, ['a', 'b'])
+  assert.deepEqual(plan.discover, []) // NOTHING re-discovered when structure is on disk
+  assert.deepEqual(plan.behaviorOnly, [])
+})
+
+test('planResume: REGRESSION — missing behavior side-car re-runs behavior only (no re-discovery/renumber)', () => {
+  const { planResume } = loadDeterministic()
+  // The mulch case: structure present, behavior agent had failed for 3 capabilities.
+  const scan = [
+    { id: 'cli-init', hasLight: true, hasBehavior: true },
+    { id: 'cli-edit', hasLight: true, hasBehavior: false },
+    { id: 'cli-query', hasLight: true, hasBehavior: false },
+    { id: 'cli-setup', hasLight: true, hasBehavior: false },
+  ]
+  const plan = planResume([ep('cli-init'), ep('cli-edit'), ep('cli-query'), ep('cli-setup')], scan)
+  // Every capability's STRUCTURE is reloaded — so the slice set (and numbering) is invariant.
+  assert.deepEqual(plan.reload, ['cli-init', 'cli-edit', 'cli-query', 'cli-setup'])
+  // The three with a missing behavior spec re-run behavior ONLY.
+  assert.deepEqual(plan.behaviorOnly, ['cli-edit', 'cli-query', 'cli-setup'])
+  // Critically: NONE are re-discovered. Re-discovery is what renumbered and duplicated.
+  assert.deepEqual(plan.discover, [])
+})
+
+test('planResume: a capability with no light.json needs full discovery', () => {
+  const { planResume } = loadDeterministic()
+  const scan = [{ id: 'a', hasLight: true, hasBehavior: true }]
+  const plan = planResume([ep('a'), ep('b')], scan) // b never analyzed
+  assert.deepEqual(plan.reload, ['a'])
+  assert.deepEqual(plan.discover, ['b'])
+  assert.deepEqual(plan.behaviorOnly, [])
+})
+
+test('planResume: preserves `epics` order (build numbering stays identical to a fresh run)', () => {
+  const { planResume } = loadDeterministic()
+  const scan = [ // deliberately scrambled vs. epics order
+    { id: 'c', hasLight: true, hasBehavior: true },
+    { id: 'a', hasLight: true, hasBehavior: false },
+    { id: 'b', hasLight: true, hasBehavior: true },
+  ]
+  const plan = planResume([ep('a'), ep('b'), ep('c')], scan)
+  assert.deepEqual(plan.reload, ['a', 'b', 'c']) // epics order, NOT scan order
+})
+
+test('planResume: every capability is classified exactly once (no drops, no double-count)', () => {
+  const { planResume } = loadDeterministic()
+  const scan = [
+    { id: 'a', hasLight: true, hasBehavior: true },
+    { id: 'b', hasLight: true, hasBehavior: false },
+    // c absent from scan entirely
+  ]
+  const epics = [ep('a'), ep('b'), ep('c')]
+  const plan = planResume(epics, scan)
+  // reload ∪ discover covers all; behaviorOnly ⊆ reload.
+  assert.deepEqual([...plan.reload, ...plan.discover].sort(), ['a', 'b', 'c'])
+  assert.ok(plan.behaviorOnly.every(id => plan.reload.includes(id)))
+  assert.equal(plan.reload.length + plan.discover.length, epics.length)
+})
+
+test('planResume: empty / missing inputs are safe', () => {
+  const { planResume } = loadDeterministic()
+  assert.deepEqual(planResume([], []), { reload: [], behaviorOnly: [], discover: [] })
+  assert.deepEqual(planResume(undefined, undefined), { reload: [], behaviorOnly: [], discover: [] })
+  assert.deepEqual(planResume([ep('a')], null), { reload: [], behaviorOnly: [], discover: ['a'] })
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only

@@ -82,11 +82,18 @@ function makeRuntime(sc, store) {
       return { slices }
     }
     if (label === 'resume:scan') {
-      // A capability is done iff BOTH its light + behavior side-cars exist on disk.
+      // Report, per capability, which DURABLE side-cars exist on disk. Structure (light.json)
+      // and behavior (behavior.json) are independent: the workflow RELOADS structure and
+      // re-runs ONLY a missing behavior spec, so it never re-discovers/renumbers.
       const files = Object.keys(store.files || {})
-      const light = new Set(files.filter(p => p.endsWith('.light.json')).map(p => p.split('/').pop().replace('.light.json', '')))
-      const behav = new Set(files.filter(p => p.endsWith('.behavior.json')).map(p => p.split('/').pop().replace('.behavior.json', '')))
-      return { epicIds: [...light].filter(id => behav.has(id)) }
+      const ids = new Set(), light = new Set(), behav = new Set()
+      for (const p of files) {
+        const base = p.split('/').pop()
+        if (base.endsWith('.light.json')) { const id = base.replace('.light.json', ''); light.add(id); ids.add(id) }
+        else if (base.endsWith('.behavior.json')) { const id = base.replace('.behavior.json', ''); behav.add(id); ids.add(id) }
+        else if (base.endsWith('.slices.json')) { ids.add(base.replace('.slices.json', '')) }
+      }
+      return { epics: [...ids].map(id => ({ id, hasLight: light.has(id), hasBehavior: behav.has(id) })) }
     }
     if (label.startsWith('light:')) {
       const id = label.slice('light:'.length)
@@ -463,6 +470,36 @@ test('resume reuses on-disk side-cars instead of re-running discovery', async ()
   assert.ok(!rec.labels.some(l => l.startsWith('discover:')), 'no capability is re-discovered')
   assert.ok(!rec.labels.some(l => l.startsWith('behavior:')), 'no behavior is re-extracted')
   assert.equal(result.counts.slicesWritten, 6, 'all features written from the checkpoint + side-cars')
+})
+
+// REGRESSION (the mulch duplicate-rewrite bug): on resume, a capability whose slice
+// STRUCTURE is on disk (light + slices side-cars) but whose BEHAVIOR side-car is missing
+// — because its behavior agent failed on the prior pass — must re-run ONLY the behavior
+// agent. It must NOT be re-discovered: re-discovery yields a different slice set and
+// RENUMBERS every downstream spec, duplicating the whole kit on top of itself. The source
+// is static, so the slice count/numbering must be invariant across resumes.
+test('resume with a missing behavior side-car re-runs behavior ONLY, never re-discovers (no renumber)', async () => {
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 2 })
+  const store = { ir: { stage: 'discovered', source: '.', sysFacts: '{}', epics: epicsData(sc.epics), epicsDone: sc.epics } }
+  seedCars(store, sc, sc.epics)
+  // Simulate e2's behavior agent having FAILED on the prior pass: its structure (light +
+  // slices) is durable on disk, but the behavior side-car was never written.
+  delete store.files[carPaths('e2').behavior]
+
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+
+  assert.equal(result.ok, true)
+  // NOTHING is re-discovered — structure is durable, so the slice set (and numbering) is fixed.
+  assert.ok(!rec.labels.some(l => l.startsWith('discover:')), 'no capability is re-discovered on resume')
+  // ONLY the capability missing its behavior side-car re-runs the behavior agent.
+  assert.deepEqual(rec.labels.filter(l => l.startsWith('behavior:')), ['behavior:e2'],
+    'exactly the behavior-missing capability re-runs behavior; the others do not')
+  // (The behavior:e2 label above proves the gap was filled during the run; the on-disk
+  // side-cars are wiped by ir:clear on successful completion, so we assert on labels.)
+  // Every feature is written exactly once under a SINGLE stable numbering (1..6) — no
+  // duplicates, no drift. Under the old "both-present-or-re-discover" gate this renumbered.
+  assert.equal(result.counts.slicesWritten, 6)
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6])
 })
 
 // ===========================================================================
