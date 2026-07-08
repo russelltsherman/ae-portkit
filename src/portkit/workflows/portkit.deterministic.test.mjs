@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations', 'planResume']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -319,31 +319,31 @@ test('planEpicBatches: partitions cover every slice exactly once (no drops)', ()
 // Normalizes the workflow's `args` input (object / JSON string / CLI string /
 // missing) into a structured config. The CLI-string branch is the regression
 // fix: when the slash-command bridge forwards the RAW argument string verbatim
-// (e.g. "--input /src/mulch" or just "/src/mulch") instead of a built object,
+// (e.g. "--input /src/myapp" or just "/src/myapp") instead of a built object,
 // parsing must still recover inputDir — otherwise the run drifts to SOURCE="."
 // (cwd). This is a STACK-NEUTRAL kit: there is no target-language argument.
 
 test('parseArgs: object passed through unchanged (happy path)', () => {
   const { parseArgs } = loadDeterministic()
-  const o = { inputDir: '/src/mulch', outputDir: '/out' }
+  const o = { inputDir: '/src/myapp', outputDir: '/out' }
   assert.equal(parseArgs(o), o) // same reference — no copy, no mangling
 })
 
 test('parseArgs: JSON object string is parsed', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('{"inputDir":"/src/mulch","outputDir":"/out"}'),
-    { inputDir: '/src/mulch', outputDir: '/out' })
+  assert.deepEqual(parseArgs('{"inputDir":"/src/myapp","outputDir":"/out"}'),
+    { inputDir: '/src/myapp', outputDir: '/out' })
 })
 
 test('parseArgs: regression — raw CLI string "--input <dir>"', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('--input /Users/x/reference/mulch'),
-    { inputDir: '/Users/x/reference/mulch' })
+  assert.deepEqual(parseArgs('--input /Users/x/reference/myapp'),
+    { inputDir: '/Users/x/reference/myapp' })
 })
 
 test('parseArgs: sole positional is the input dir', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('/src/mulch'), { inputDir: '/src/mulch' })
+  assert.deepEqual(parseArgs('/src/myapp'), { inputDir: '/src/myapp' })
 })
 
 test('parseArgs: --input flag wins over positional input dir', () => {
@@ -361,8 +361,8 @@ test('parseArgs: --output and its aliases map to outputDir', () => {
 
 test('parseArgs: --flag=value form', () => {
   const { parseArgs } = loadDeterministic()
-  assert.deepEqual(parseArgs('--input=/src/mulch --output=/out'),
-    { inputDir: '/src/mulch', outputDir: '/out' })
+  assert.deepEqual(parseArgs('--input=/src/myapp --output=/out'),
+    { inputDir: '/src/myapp', outputDir: '/out' })
 })
 
 test('parseArgs: unknown tuning knobs pass through (camelCase preserved)', () => {
@@ -414,6 +414,65 @@ test('stageDone: partial discovery is not complete discovery', () => {
 test('stageDone: an unknown target is never satisfied', () => {
   const { stageDone } = loadDeterministic()
   assert.equal(stageDone('writing', 'bogus'), false)
+})
+
+// --- stage ladder: critiqued/distilled promoted to first-class stages --------
+test('stageList: is the ordered ladder incl. the new terminal critiqued/distilled', () => {
+  const { stageList } = loadDeterministic()
+  assert.deepEqual(stageList(), ['mapped', 'discovering', 'discovered', 'synthesized', 'docs', 'adrs', 'writing', 'critiqued', 'distilled'])
+})
+
+test('stageIndex/stageDone extend cleanly to the new stages', () => {
+  const { stageIndex, stageDone } = loadDeterministic()
+  assert.ok(stageIndex('critiqued') > stageIndex('writing'))
+  assert.ok(stageIndex('distilled') > stageIndex('critiqued'))
+  // a resume past the critic counts writing/adrs/etc as done, and the critic itself
+  assert.equal(stageDone('critiqued', 'writing'), true)
+  assert.equal(stageDone('critiqued', 'critiqued'), true)
+  assert.equal(stageDone('critiqued', 'distilled'), false)
+  assert.equal(stageDone('distilled', 'critiqued'), true)
+})
+
+// --- stopAfter (per-phase ceiling) ------------------------------------------
+test('stopAfter: no ceiling (null/undefined) never pauses — the /portkit full-run path', () => {
+  const { stopAfter } = loadDeterministic()
+  for (const s of ['mapped', 'discovered', 'docs', 'adrs', 'writing', 'critiqued', 'distilled']) {
+    assert.equal(stopAfter(s, null), false, `${s} must not pause without a ceiling`)
+    assert.equal(stopAfter(s, undefined), false)
+  }
+})
+
+test('stopAfter: pauses once the current stage reaches or passes the ceiling', () => {
+  const { stopAfter } = loadDeterministic()
+  // ceiling = 'docs': earlier stages keep going, docs and beyond pause
+  assert.equal(stopAfter('mapped', 'docs'), false)
+  assert.equal(stopAfter('discovered', 'docs'), false)
+  assert.equal(stopAfter('docs', 'docs'), true)
+  assert.equal(stopAfter('adrs', 'docs'), true) // already past the ceiling -> still pauses
+})
+
+test('stopAfter: /portkit-map stops only at mapped, not before', () => {
+  const { stopAfter } = loadDeterministic()
+  assert.equal(stopAfter('mapped', 'mapped'), true)
+  // there is no earlier real stage than mapped; unknown current stage never pauses
+  assert.equal(stopAfter('bogus', 'mapped'), false)
+})
+
+test('stopAfter: an unknown ceiling fails open to a full run (never pauses)', () => {
+  const { stopAfter } = loadDeterministic()
+  assert.equal(stopAfter('mapped', 'bogus'), false)
+  assert.equal(stopAfter('distilled', 'typo'), false)
+})
+
+// --- stageAfter (next-phase hint) -------------------------------------------
+test('stageAfter: returns the following ladder stage, null past the end', () => {
+  const { stageAfter } = loadDeterministic()
+  assert.equal(stageAfter('mapped'), 'discovering')
+  assert.equal(stageAfter('adrs'), 'writing')
+  assert.equal(stageAfter('writing'), 'critiqued')
+  assert.equal(stageAfter('critiqued'), 'distilled')
+  assert.equal(stageAfter('distilled'), null)
+  assert.equal(stageAfter('bogus'), null)
 })
 
 // --- chunk -------------------------------------------------------------------
@@ -530,7 +589,7 @@ test('budgetExhausted: zero reserve yields only when fully spent', () => {
 test('findSourceCitations: matches backticked and bare path:line refs, with ranges and lists', () => {
   const { findSourceCitations } = loadDeterministic()
   assert.deepEqual(
-    findSourceCitations('`getMulchDir` (`src/utils/config.ts:191-193`) delegates to resolveWorktreeRoot.'),
+    findSourceCitations('`getConfigDir` (`src/utils/config.ts:191-193`) delegates to resolveWorktreeRoot.'),
     ['`src/utils/config.ts:191-193`'])
   assert.deepEqual(
     findSourceCitations('normalized to a map on read, src/utils/config.ts:219-229.'),
@@ -544,7 +603,7 @@ test('findSourceCitations: matches backticked and bare path:line refs, with rang
 
 test('findSourceCitations: does NOT match artifact paths, tags, or ratios (kept in the clean kit)', () => {
   const { findSourceCitations } = loadDeterministic()
-  assert.deepEqual(findSourceCitations('write to `.mulch/config.yaml` and `.mulch/expertise/`'), [])
+  assert.deepEqual(findSourceCitations('write to `.config/settings.yaml` and `.config/templates/`'), [])
   assert.deepEqual(findSourceCitations('`[INFERRED]` the goal is to accumulate expertise.'), [])
   assert.deepEqual(findSourceCitations('This is `[UNVERIFIED]` — no test covers it.'), [])
   assert.deepEqual(findSourceCitations('a ratio of 10:30 and a time 09:05'), [])
@@ -574,7 +633,7 @@ test('planResume: light-only capabilities are RELOADED, never re-discovered', ()
 
 test('planResume: REGRESSION — missing behavior side-car re-runs behavior only (no re-discovery/renumber)', () => {
   const { planResume } = loadDeterministic()
-  // The mulch case: structure present, behavior agent had failed for 3 capabilities.
+  // The failure case: structure present, behavior agent had failed for 3 capabilities.
   const scan = [
     { id: 'cli-init', hasLight: true, hasBehavior: true },
     { id: 'cli-edit', hasLight: true, hasBehavior: false },
@@ -630,6 +689,44 @@ test('planResume: empty / missing inputs are safe', () => {
   assert.deepEqual(planResume([], []), { reload: [], behaviorOnly: [], discover: [] })
   assert.deepEqual(planResume(undefined, undefined), { reload: [], behaviorOnly: [], discover: [] })
   assert.deepEqual(planResume([ep('a')], null), { reload: [], behaviorOnly: [], discover: ['a'] })
+})
+
+// --- omissionScopeNote (tell the critic/gap-fill that a DEV/TEST truncation is INTENTIONAL) ---
+
+test('omissionScopeNote: no intentional omission -> empty string (full run prompts byte-identical)', () => {
+  const { omissionScopeNote } = loadDeterministic()
+  assert.equal(omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, epicsKept: 3, epicsTotal: 3 }), '')
+  assert.equal(omissionScopeNote({}), '')
+  assert.equal(omissionScopeNote(), '')
+  // epicsKept >= epicsTotal (no cap) and no slices omitted is also empty.
+  assert.equal(omissionScopeNote({ epicsKept: 5, epicsTotal: 3 }), '')
+})
+
+test('omissionScopeNote: limitSlices omission names the count + the do-NOT-backfill directives', () => {
+  const { omissionScopeNote } = loadDeterministic()
+  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, epicsKept: 2, epicsTotal: 2 })
+  assert.match(note, /INTENTIONAL TEST-SCOPE/)
+  assert.match(note, /7 feature spec\(s\) were INTENTIONALLY omitted/)
+  assert.match(note, /limitSlices=3/)
+  assert.match(note, /do NOT .*regenerate|back-fill/i)
+  // it must NOT mention a maxEpics cap when none happened
+  assert.ok(!/capability\(ies\) were INTENTIONALLY dropped/.test(note))
+})
+
+test('omissionScopeNote: maxEpics cap names kept-of-total', () => {
+  const { omissionScopeNote } = loadDeterministic()
+  const note = omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, epicsKept: 2, epicsTotal: 4 })
+  assert.match(note, /INTENTIONAL TEST-SCOPE/)
+  assert.match(note, /2 capability\(ies\) were INTENTIONALLY dropped/)
+  assert.match(note, /2 of 4/)
+  assert.ok(!/feature spec\(s\) were INTENTIONALLY omitted/.test(note))
+})
+
+test('omissionScopeNote: both arms fire together', () => {
+  const { omissionScopeNote } = loadDeterministic()
+  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, epicsKept: 2, epicsTotal: 4 })
+  assert.match(note, /7 feature spec\(s\) were INTENTIONALLY omitted/)
+  assert.match(note, /2 capability\(ies\) were INTENTIONALLY dropped/)
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only

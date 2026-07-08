@@ -33,14 +33,37 @@ Examples:
 ```
 
 - **input dir** — codebase to analyze: positional `[input-dir]` or `--input <dir>`. Default `.`.
-- **`--output <dir>`** — where docs are written. Default `<input-dir>_recreation` (a sibling of the
+- **`--output <dir>`** — where docs are written. Default `<input-dir>_portkit` (a sibling of the
   input dir; output is never nested inside the source tree).
 
-> **Prerequisite:** the Workflow tool is gated behind an env var. Enable it first:
-> `export CLAUDE_CODE_WORKFLOWS=1 && claude`, or persist
-> `{ "env": { "CLAUDE_CODE_WORKFLOWS": "1" } }` in `.claude/settings.local.json`.
+> **Prerequisite:** the Workflow tool (part of Claude Code) must be available. It is enabled via your
+> Claude settings — there is no `CLAUDE_CODE_WORKFLOWS` shell env var to set. If a run errors because
+> workflows are unavailable, enable them in Claude Code.
 
-## Output (`<input-dir>_recreation/`)
+### Run it phase by phase
+
+`/portkit` runs the whole pipeline end to end. To **review the output between phases** (or iterate on
+one phase during development), run the per-phase commands instead — each advances the pipeline to its
+stage, **pauses** for you to inspect the output, and leaves a resumable checkpoint the next command
+continues from:
+
+| Command | Stops after | Review |
+|---|---|---|
+| `/portkit-map` | Map | the capability inventory |
+| `/portkit-discover` | Discover | slices + behavior side-cars |
+| `/portkit-synthesize` | Synthesize | `INDEX` / `ACCEPTANCE` / `ARCHITECTURE` / `PRD` |
+| `/portkit-adrs` | ADRs | `adr/*.md` |
+| `/portkit-specs` | Write specs | `specs/*.md` |
+| `/portkit-critic` | Critic | `RISKS-AND-GAPS.md` |
+| `/portkit-distill` | Distill (terminal) | `distilled/` mirror — finishes and clears the checkpoint |
+
+All phase commands take the same `[input-dir] [--input <dir>] [--output <dir>]` arguments as `/portkit`
+and must resolve the same output dir so they share one checkpoint. Resume is forgiving: running a later
+command first simply advances the ladder from the start and stops at that phase. Because pausing keeps
+the checkpoint, a phase command does **not** re-run an already-completed phase (resume skips it) — to
+re-iterate a phase during development, use `--fresh` or a throwaway `--output` dir.
+
+## Output (`<input-dir>_portkit/`)
 
 | Path | What |
 |---|---|
@@ -70,12 +93,12 @@ specialist agents:
 
 ### Tuning knobs (optional `args`)
 
-`inputDir` (default `.`), `outputDir` (default `<inputDir>_recreation`), `maxEpics` (40), `maxAdrs`
+`inputDir` (default `.`), `outputDir` (default `<inputDir>_portkit`), `maxEpics` (40), `maxAdrs`
 (12), `maxGapfillRounds` (2), `maxConcurrency` (8), `checkpointEvery` (default `maxConcurrency` —
 capabilities analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
 ceiling), `maxTokensPerRun` (0 = unlimited — a per-invocation token ceiling for subscription-window
 chunking, see below), `tokenReserve` (50000 — tokens held back for the finishing critic pass),
-`distill` (false — after the critic, emit a citation-free `rebuild/` mirror for the weaker rebuilder;
+`distill` (false — after the critic, emit a citation-free `distilled/` mirror for the weaker rebuilder;
 see below), `fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
 auto-resume is the normal path). (`sourcePath`/`outDir` are accepted as legacy aliases for
 `inputDir`/`outputDir`.) **Features are never capped** — they are the deliverable, so dropping them is
@@ -122,9 +145,9 @@ anti-hallucination receipts the generator and critic depend on, and what lets *y
 But the downstream consumer is a *weaker* model that rebuilds from the docs **without the source**, so
 those references point at files it can't open — inert clutter at best, a hallucination/cargo-cult
 vector at worst. With `distill: true`, after the critic validates the kit PortKit emits a citation-free
-**mirror** under `<outputDir>/rebuild/` (ARCHITECTURE/PRD/INDEX/ACCEPTANCE + every spec + every ADR,
+**mirror** under `<outputDir>/distilled/` (ARCHITECTURE/PRD/INDEX/ACCEPTANCE + every spec + every ADR,
 internal links intact): verified `path:line` refs are stripped, while `[INFERRED]`/`[UNVERIFIED]` flags
-and real artifact paths (e.g. `.mulch/config.yaml`) are kept. Hand the rebuilder `rebuild/`; keep the
+and real artifact paths (e.g. `.config/settings.yaml`) are kept. Hand the rebuilder `distilled/`; keep the
 top-level cited kit for review. Each distilled doc self-checks for leftover citations
 (`counts.residualCitations`).
 

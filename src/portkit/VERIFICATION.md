@@ -49,10 +49,8 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
 
 ### Prerequisites
 
-1. Enable the Workflow tool:
-   ```bash
-   export CLAUDE_CODE_WORKFLOWS=1 && claude
-   ```
+1. The Workflow tool (part of Claude Code) must be available — enabled via your Claude settings, not
+   a `CLAUDE_CODE_WORKFLOWS` shell env var (that variable is not used).
 2. A small **source fixture with good test coverage** — one language, modest size. **No fixture
    ships in this repo yet** (`src/examples/` does not exist); Tier 2 is blocked until one is added.
    The intended fixture is a tested Go HTTP JSON service (~4 vertical capabilities, `go test ./...`
@@ -68,7 +66,7 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
 
 | # | Gate | How to check |
 |---|---|---|
-| 1 | Full doc set produced | `PRD.md`, `ARCHITECTURE.md`, `INDEX.md`, `ACCEPTANCE.md`, `RISKS-AND-GAPS.md`, ≥1 `specs/NNNN-*.md` all exist under the fixture's `_recreation/` dir |
+| 1 | Full doc set produced | `PRD.md`, `ARCHITECTURE.md`, `INDEX.md`, `ACCEPTANCE.md`, `RISKS-AND-GAPS.md`, ≥1 `specs/NNNN-*.md` all exist under the fixture's `_portkit/` dir |
 | 2 | Grounding | Sample `path:line` citations in ARCHITECTURE.md and the feature specs; each resolves to real source |
 | 3 | Feature-spec integrity | `INDEX.md` order is topological; pick 3 feature specs — each is end-to-end, self-contained, has acceptance criteria, references only ARCHITECTURE.md (no dangling cross-feature refs) |
 | 4 | Acceptance spec | `ACCEPTANCE.md` criteria trace back to actual fixture tests; thin areas are flagged |

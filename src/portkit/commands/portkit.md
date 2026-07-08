@@ -22,25 +22,21 @@ Parse them as: `[input-dir] [--input <dir>] [--output <dir>]`
 - **input dir** — the codebase root to analyze. Provide it either as the positional `[input-dir]`
   or via `--input <dir>` (the flag wins if both are given). Defaults to the current directory (`.`).
 - **`--output <dir>`** (optional): where to write the generated docs. Defaults to a **sibling** of
-  the input dir named `<input-dir>_recreation` (e.g. `/src/mulch` → `/src/mulch_recreation`).
+  the input dir named `<input-dir>_portkit` (e.g. `/src/myapp` → `/src/myapp_portkit`).
   Output is never nested inside the input dir, so it does not pollute the source tree.
 
 When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
 
 ## Steps
 
-1. **Confirm the Workflow tool is enabled.** It is gated behind an env var. Run:
-   ```bash
-   echo "${CLAUDE_CODE_WORKFLOWS:-<not set>}"
-   ```
-   If it is `<not set>`, STOP and tell the user to enable it before this command can run, either:
-   - per session: `export CLAUDE_CODE_WORKFLOWS=1 && claude`, or
-   - persistently in `.claude/settings.local.json`: `{ "env": { "CLAUDE_CODE_WORKFLOWS": "1" } }`
+1. **Requires the Workflow tool** (part of Claude Code, enabled via your Claude settings — there is
+   no `CLAUDE_CODE_WORKFLOWS` shell env var, contrary to earlier docs). If the workflow invocation
+   below errors because workflows are unavailable, enable them in Claude Code, then retry.
 
 2. **Build the args object** from the parsed arguments:
    - `inputDir`: the resolved input dir (`--input` flag, else positional `[input-dir]`, else `"."`).
    - `outputDir`: the `--output` value if given; otherwise omit it and let the workflow default to
-     `<inputDir>_recreation`.
+     `<inputDir>_portkit`.
    - `fresh: true` (from `--fresh`): ignore any existing checkpoint at the output dir and reprocess
      from scratch (see **Resuming** below). Omit it for the normal auto-resume behavior.
    - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`, `maxAdrs`
@@ -59,12 +55,12 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      wins over `maxTokensPerRun`; with neither set, behavior is exactly as before (no pausing). Pair
      with `/loop /portkit …` to drive a huge project to completion across many budget-sized chunks.
    - `distill` (default `false`): after the critic validates the kit, emit a **citation-free mirror**
-     under `<output>/rebuild/` for the weaker downstream model that rebuilds from the docs. The
+     under `<output>/distilled/` for the weaker downstream model that rebuilds from the docs. The
      top-level docs keep their `path:line` source citations (useful to *you* for auditing grounding),
-     but those references point at source the rebuilder can't open — so the `rebuild/` copy strips
+     but those references point at source the rebuilder can't open — so the `distilled/` copy strips
      them while keeping `[INFERRED]`/`[UNVERIFIED]` flags and real artifact paths. Point the rebuilder
-     at `rebuild/`, keep the top level for review. Reported via `counts.distilledDocs` /
-     `counts.residualCitations` and `keyDocs.rebuildDir`.
+     at `distilled/`, keep the top level for review. Reported via `counts.distilledDocs` /
+     `counts.residualCitations` and `keyDocs.distilledDir`.
    - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N feature specs
      (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
      adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —
@@ -127,7 +123,7 @@ ignored (never a wrong-codebase resume), and it is deleted automatically when th
 
 ## Notes
 
-- Output lands in the sibling dir `<input-dir>_recreation/` by default, never inside the input dir.
+- Output lands in the sibling dir `<input-dir>_portkit/` by default, never inside the input dir.
   The kit is **stack-neutral** — a PRD, an architecture spec, per-feature specs, MADR-style ADRs,
   and an acceptance-criteria rollup — so it describes what to rebuild without prescribing a target
   language.
@@ -135,3 +131,9 @@ ignored (never a wrong-codebase resume), and it is deleted automatically when th
   goals/non-goals/success metrics, ADR rationale/"why") is tagged `[INFERRED]` — never presented as
   observed fact.
 - This command produces **documents only** — it does not perform the recreation.
+- **Per-phase commands:** to run the pipeline one stage at a time and review the output between phases
+  (or iterate on a single phase during development), use `/portkit-map`, `/portkit-discover`,
+  `/portkit-synthesize`, `/portkit-adrs`, `/portkit-specs`, `/portkit-critic`, `/portkit-distill`. Each
+  advances the pipeline to its stage, pauses, and leaves a resumable checkpoint the next command
+  continues from. They share this command's arguments and checkpoint; `/portkit` remains the full
+  end-to-end run.

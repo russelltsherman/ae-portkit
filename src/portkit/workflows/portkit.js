@@ -10,7 +10,7 @@ export const meta = {
     { title: 'ADRs', detail: 'discover architecturally significant decisions; write one MADR-style ADR each' },
     { title: 'Write specs', detail: 'one self-contained, self-testing feature spec per unit' },
     { title: 'Critic', detail: 'grounding + completeness pass; write RISKS-AND-GAPS.md' },
-    { title: 'Distill', detail: 'opt-in: emit a citation-free rebuild/ mirror for the weaker rebuilder' },
+    { title: 'Distill', detail: 'opt-in: emit a citation-free distilled/ mirror for the weaker rebuilder' },
   ],
 }
 
@@ -19,7 +19,7 @@ export const meta = {
 // ---------------------------------------------------------------------------
 // args may arrive as a structured object (from the slash command / a hand call),
 // a JSON string, a raw CLI string forwarded by the skill/command bridge (e.g.
-// "--input /src/mulch" or just "/src/mulch"), or undefined. parseArgs()
+// "--input /src/myapp" or just "/src/myapp"), or undefined. parseArgs()
 // (deterministic region) normalizes all of them to a config object — crucially
 // recovering inputDir from the CLI-string form so the run never silently drifts
 // to the cwd. This is a STACK-NEUTRAL recreation kit: there is no target language.
@@ -27,16 +27,22 @@ const cfg = parseArgs(args)
 // Input dir. Preferred name: inputDir; legacy fallback: sourcePath.
 const SOURCE = cfg.inputDir || cfg.sourcePath || '.'
 // Output dir. Preferred name: outputDir; legacy fallback: outDir. When unset it
-// defaults to a SIBLING of the input dir named "<inputDir>_recreation" (e.g.
-// /src/mulch -> /src/mulch_recreation). We deliberately do NOT nest output inside
+// defaults to a SIBLING of the input dir named "<inputDir>_portkit" (e.g.
+// /src/myapp -> /src/myapp_portkit). We deliberately do NOT nest output inside
 // the input dir — that pollutes the source tree (it shows up as untracked files
-// in the source's own repo). When inputDir is unset SOURCE is ".", which has no
-// sensible sibling, so we fall back to "portkit_recreation" in the cwd.
+// in the source's own repo). When inputDir is unset SOURCE is "." (the cwd); we
+// resolve the cwd's OWN directory name and suffix that, so analyzing a project
+// dir named "portkit" defaults to "portkit_portkit". If the runtime does not
+// expose the cwd, fall back to the literal "portkit_portkit".
 const OUT = (() => {
   if (cfg.outputDir || cfg.outDir) return cfg.outputDir || cfg.outDir
   const base = SOURCE.replace(/\/+$/, '')
-  if (base === '.' || base === '') return 'portkit_recreation'
-  return `${base}_recreation`.replace(/^\.\//, '')
+  if (base === '.' || base === '') {
+    let cwdName = ''
+    try { cwdName = String(process.cwd()).replace(/\/+$/, '').split('/').pop() || '' } catch { /* no cwd access */ }
+    return `${cwdName || 'portkit'}_portkit`
+  }
+  return `${base}_portkit`.replace(/^\.\//, '')
 })()
 
 // ---------------------------------------------------------------------------
@@ -68,12 +74,20 @@ const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 // normally SKIP an existing non-empty output (so a resume never re-authors it); on a fresh run they
 // must OVERWRITE instead, otherwise a re-run over a prior (e.g. smaller/aborted) kit keeps the stale
 // docs and yields a Frankenstein. rewriteClause injects the right instruction into each writer.
-// DISTILL (opt-in): after the critic validates the kit, emit a CLEAN mirror under <OUT>/rebuild/
+// DISTILL (opt-in): after the critic validates the kit, emit a CLEAN mirror under <OUT>/distilled/
 // with the verified `path:line` source citations stripped — the receipts help the generator/critic
 // and a human auditor, but a weaker rebuilder cannot open them and is only confused (or led to
 // hallucinate) by them. `[INFERRED]`/`[UNVERIFIED]` flags and artifact paths (no line number) are
 // kept. The cited originals stay at the top level as the grounding/audit copy.
 const DISTILL = !!cfg.distill
+
+// Phase ceiling (per-phase commands: /portkit-map, /portkit-adrs, …). When set to a
+// ladder stage name, the run advances to that stage, persists the checkpoint, and
+// PAUSES (returns { paused: true }) instead of continuing — so each phase command can
+// stop at its own boundary and the next command resumes from the durable checkpoint.
+// Unset (the /portkit full run) => null => never pauses => byte-identical to today.
+// Validated leniently by stopAfter(): an unknown value never pauses (runs to the end).
+const UNTIL = cfg.until != null ? String(cfg.until) : null
 
 const FRESH = !!cfg.fresh
 const rewriteClause = (path) => FRESH
@@ -177,7 +191,7 @@ function specName(n, name) { return `${pad(n)}-${slug(name)}.md` }
 // no matter how it arrives. The slash command is SUPPOSED to hand us a structured
 // object ({ inputDir, outputDir }), but when the workflow is launched via the
 // skill/command bridge the RAW argument string is forwarded verbatim instead
-// (e.g. "--input /src/mulch" or just "/src/mulch"). Before this helper that string
+// (e.g. "--input /src/myapp" or just "/src/myapp"). Before this helper that string
 // fell through to SOURCE=".", silently analyzing the cwd (the WRONG codebase). This
 // is the single normalization point; it accepts every shape:
 //   - object               -> returned as-is (already structured; the happy path)
@@ -393,8 +407,15 @@ function planEpicBatches(epicTree, perBatch) {
 // the IR as `stage`. A resume skips every stage whose work is already done. The
 // intermediate 'discovering' marks a PARTIALLY complete discovery phase (some
 // capabilities analyzed, more to go), so it sits between 'mapped' and 'discovered'.
+// 'critiqued' and 'distilled' are the terminal stages (Critic + the opt-in Distill
+// mirror), promoted to first-class ladder stages so the per-phase commands can stop
+// after each. stageList() is the single source of truth for the order; stageIndex()
+// and stageAfter() both derive from it (keeping the array in one place).
+function stageList() {
+  return ['mapped', 'discovering', 'discovered', 'synthesized', 'docs', 'adrs', 'writing', 'critiqued', 'distilled']
+}
 function stageIndex(stage) {
-  return ['mapped', 'discovering', 'discovered', 'synthesized', 'docs', 'adrs', 'writing'].indexOf(stage)
+  return stageList().indexOf(stage)
 }
 // stageDone — has the run already COMPLETED `target`'s work? True iff the saved
 // stage is at or beyond target. An unknown/absent stage (fresh run) -> false, so a
@@ -404,6 +425,25 @@ function stageDone(current, target) {
   const c = stageIndex(current)
   const t = stageIndex(target)
   return t >= 0 && c >= t
+}
+// stopAfter — PURE. Should the run PAUSE after completing `stage`? True iff a phase
+// ceiling `until` is set and `stage` is at or beyond it. `until` null/undefined (no
+// ceiling) => never pauses => a full run, byte-identical to today. An unknown `until`
+// (not on the ladder) => stageIndex(until) is -1 => never pauses (fail-open to a full
+// run: a mistyped ceiling produces a complete kit rather than silently stopping early).
+function stopAfter(stage, until) {
+  if (until == null) return false
+  const u = stageIndex(until)
+  if (u < 0) return false
+  const c = stageIndex(stage)
+  return c >= 0 && c >= u
+}
+// stageAfter — PURE. The ladder stage following `stage`, or null if `stage` is the last
+// (or unknown). Used only to tell the user which phase comes next when a run pauses.
+function stageAfter(stage) {
+  const l = stageList()
+  const i = l.indexOf(stage)
+  return (i >= 0 && i + 1 < l.length) ? l[i + 1] : null
 }
 
 // chunk — split an array into fixed-size, order-preserving groups (used to batch
@@ -435,7 +475,7 @@ function budgetExhausted(total, spent, reserve) {
 // them, so the distill pass strips them from the consumer-facing kit. This is the single, tested
 // definition of "a citation" that both the distiller's prompt and its verify step rely on.
 // It deliberately does NOT match:
-//   - a path with NO line number (e.g. `.mulch/config.yaml`) — a real artifact the rebuild produces
+//   - a path with NO line number (e.g. `.config/settings.yaml`) — a real artifact the rebuild produces
 //   - `[INFERRED]` / `[UNVERIFIED]` tags — those carry real meaning and are KEPT
 //   - bare ratios/times like `10:30` — no file extension precedes the colon
 function findSourceCitations(text) {
@@ -470,6 +510,31 @@ function planResume(epics, scan) {
     }
   }
   return { reload, behaviorOnly, discover }
+}
+
+// omissionScopeNote — PURE. A DEV/TEST run can intentionally omit work: `limitSlices` writes only
+// the first N feature specs (in build order), and `maxEpics` analyzes only the first M capabilities.
+// Those omissions are BY DESIGN and are reported LOUDLY as a PARTIAL test kit — they are NOT defects.
+// This builds the scope caveat prepended to the critic + gap-fix prompts so the gap-fill loop never
+// "repairs" a deliberate truncation by regenerating the omitted specs (or reverse-engineering a
+// dropped capability straight from source) — which would silently convert a partial test kit into a
+// claimed-complete one, contradicting the run's own testLimited/slicesOmittedForTest report. Returns
+// '' when NOTHING was intentionally omitted, so a full/unlimited run's prompts stay byte-identical.
+function omissionScopeNote({ slicesOmittedForTest = 0, limitSlices = 0, epicsKept = 0, epicsTotal = 0 } = {}) {
+  const parts = []
+  if (slicesOmittedForTest > 0) {
+    parts.push(`${slicesOmittedForTest} feature spec(s) were INTENTIONALLY omitted (limitSlices=${limitSlices}: only the first ${limitSlices} feature(s) in build order were written)`)
+  }
+  if (epicsTotal > epicsKept) {
+    parts.push(`${epicsTotal - epicsKept} capability(ies) were INTENTIONALLY dropped (maxEpics cap: only ${epicsKept} of ${epicsTotal} discovered capability(ies) were analyzed)`)
+  }
+  if (parts.length === 0) return ''
+  return `INTENTIONAL TEST-SCOPE LIMITS — READ THIS FIRST: this is a deliberately PARTIAL test kit, NOT a complete recreation kit. ` +
+    `${parts.join('; ')}. These omissions are BY DESIGN, not defects. Audit ONLY the features and capabilities actually present in the kit. ` +
+    `Do NOT report an intentionally-omitted feature or capability as a "missing piece" or gap, do NOT mark such a gap fixable, and do NOT ` +
+    `(and any fix agent MUST NOT) regenerate, back-fill, or reverse-engineer the omitted feature specs or capabilities. A dependsOn that ` +
+    `points at an intentionally-omitted feature is expected and MUST NOT be flagged. Editing INDEX/ACCEPTANCE to claim the full feature ` +
+    `set is present is FORBIDDEN — the partial scope must remain accurately reported.`
 }
 // </portkit:deterministic>
 
@@ -678,13 +743,14 @@ const IR_SCHEMA = {
   type: 'object',
   required: [],
   properties: {
-    stage: { type: 'string', description: 'mapped | discovering | discovered | synthesized | docs | adrs | writing' },
+    stage: { type: 'string', description: 'mapped | discovering | discovered | synthesized | docs | adrs | writing | critiqued | distilled' },
     source: { type: 'string', description: 'the inputDir this checkpoint belongs to (fingerprint for auto-resume)' },
     fileCount: { type: 'number' },
     partitioned: { type: 'boolean', description: 'was over-scale write partitioning engaged?' },
     sysFacts: { type: 'string' },
     fresh: {},
-    epics: { type: 'array', items: {}, description: 'the mapped capability inventory' },
+    epics: { type: 'array', items: {}, description: 'the mapped capability inventory (after the maxEpics cap)' },
+    epicsTotal: { type: 'number', description: 'capabilities discovered BEFORE the maxEpics cap — lets the critic report an intentional maxEpics drop as out-of-scope on resume' },
     epicsDone: { type: 'array', items: { type: 'string' }, description: 'ids of capabilities whose discovery finished (slice data lives in side-cars, not here)' },
     merges: { type: 'array', items: {}, description: 'dedup merge groups (the build order is recomputed from these + the light slices)' },
     adrs: { type: 'array', items: {}, description: 'discovered decisions (authored once)' },
@@ -693,6 +759,8 @@ const IR_SCHEMA = {
     scale: { type: 'object', description: 'the run\'s scale knobs {maxEpics, limitSlices} — resume aborts on a mismatch' },
     truncations: { type: 'array', items: { type: 'string' }, description: 'cumulative truncation/dedup ledger' },
     written: { type: 'array', items: { type: 'number' }, description: 'build numbers already written' },
+    gaps: { type: 'array', items: {}, description: 'critic findings (small; reloaded on a resume past the critic so finalize can report the counts)' },
+    distill: { type: 'object', description: 'distill result counts { docs, residual, failed }, persisted once distill runs' },
   },
 }
 
@@ -814,6 +882,31 @@ function yieldForBudget(stage, extraCounts = {}) {
 // ceiling is smaller than a single phase's cost.
 function budgetYieldNow() { return didWorkThisTurn && shouldYieldForBudget() }
 
+// Deliberate phase stop for the per-phase commands (via UNTIL). The stage's saveStage
+// already persisted the checkpoint, so this just records a note and returns a { paused }
+// result. Unlike yieldForBudget it sets NO resumeRequired/stoppedForBudget flag — the
+// command must NOT auto-re-invoke; a human reviews the phase output, then runs the next
+// phase command. Crucially it NEVER clears the checkpoint (that only happens at natural
+// completion, in finalize()), so the next phase resumes from where this one stopped.
+// stage->next-command map is informational only (guides the user's next step).
+const NEXT_COMMAND = {
+  mapped: '/portkit-discover', discovering: '/portkit-discover', discovered: '/portkit-synthesize',
+  synthesized: '/portkit-synthesize', docs: '/portkit-adrs', adrs: '/portkit-specs',
+  writing: '/portkit-critic', critiqued: '/portkit-distill', distilled: null,
+}
+function pausedAfter(stage, extraCounts = {}) {
+  const nextCmd = NEXT_COMMAND[stage]
+  const note = `⏸️  Stopped after stage '${stage}' (phase ceiling until='${UNTIL}'). Checkpoint kept at ` +
+    `\`${IR_PATH}\` — review this phase's output, then run ${nextCmd ? `\`${nextCmd}\`` : 'the next phase'} to continue.`
+  log(note)
+  return {
+    ok: true, outDir: OUT, paused: true, stage, next: stageAfter(stage), nextCommand: nextCmd,
+    resumeArgs: { resume: true, outputDir: OUT },
+    counts: { ...extraCounts },
+    truncations: dropped,
+  }
+}
+
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
@@ -910,10 +1003,12 @@ async function discoverEpic(epic, sysFacts) {
   return { epicId: epic.id, slices: lightSlices }
 }
 
-async function runCritic() {
+async function runCritic(scopeNote = '') {
   phase('Critic')
+  const scopePrefix = scopeNote ? `${scopeNote}\n\n` : '' // '' on a full run ⇒ prompts byte-identical to today
   function criticPrompt(round, prior) {
-    return `You are the PortKit CRITIC. Audit the generated recreation kit under \`${OUT}\` for whether a LESS ` +
+    return scopePrefix +
+      `You are the PortKit CRITIC. Audit the generated recreation kit under \`${OUT}\` for whether a LESS ` +
       `CAPABLE local model could rebuild the project from it ALONE.\n\nCheck for:\n` +
       `- Unresolved/uncheckable \`path:line\` citations (sample and verify against \`${SOURCE}\`).\n` +
       `- Thin/missing test coverage not flagged in \`${OUT}/ACCEPTANCE.md\`.\n` +
@@ -937,6 +1032,7 @@ async function runCritic() {
     const fixable = gaps.filter(g => g.fixable)
     log(`Gap-fill round ${round}: attempting ${fixable.length} fixable gap(s).`)
     await pooled(fixable.map((g, i) => () => agent(
+      scopePrefix +
       `You are the PortKit GAP-FIX agent. Resolve this gap by editing ONLY files under \`${OUT}\` (the generated ` +
       `recreation kit). Read the source at \`${SOURCE}\` as needed, but you MUST NOT create, modify, or delete ANY ` +
       `file outside \`${OUT}\` — never touch the source tree. If the gap is thin/missing coverage in the SOURCE's ` +
@@ -953,7 +1049,7 @@ async function runCritic() {
   return gaps
 }
 
-// Distill (opt-in): emit a citation-free MIRROR of the kit under <OUT>/rebuild/ for the weaker
+// Distill (opt-in): emit a citation-free MIRROR of the kit under <OUT>/distilled/ for the weaker
 // rebuilder. `docPaths` are relative to OUT (ARCHITECTURE.md, PRD.md, INDEX.md, ACCEPTANCE.md, every
 // specs/*.md and adr/*.md). Each doc is stripped by its own agent (file-to-file, so large docs never
 // round-trip through the orchestrator), then self-checks for residual `path:line` refs. Returns the
@@ -962,16 +1058,16 @@ const DISTILLED = {
   type: 'object',
   required: ['path'],
   properties: {
-    path: { type: 'string', description: 'the rebuild/ path written' },
+    path: { type: 'string', description: 'the distilled/ path written' },
     residualCitations: { type: 'number', description: 'count of `path:line` refs still present after stripping (should be 0)' },
   },
 }
 async function runDistill(docPaths) {
   phase('Distill')
-  log(`Distilling ${docPaths.length} doc(s) into \`${OUT}/rebuild/\` (citation-free copy for the rebuilder).`)
+  log(`Distilling ${docPaths.length} doc(s) into \`${OUT}/distilled/\` (citation-free copy for the rebuilder).`)
   const reports = await pooled(docPaths.map((rel) => () => {
     const src = `${OUT}/${rel}`
-    const dst = `${OUT}/rebuild/${rel}`
+    const dst = `${OUT}/distilled/${rel}`
     return agent(
       `You are the PortKit DISTILL agent. Produce a CLEAN, citation-free copy of ONE kit document for a ` +
       `LESS CAPABLE local model that will rebuild the software from the docs ALONE — it has NO access to the ` +
@@ -983,8 +1079,8 @@ async function runDistill(docPaths) {
       `Remove the citation AND tidy the surrounding prose (drop now-empty parens, dangling "see"/"per"/"verified", ` +
       `stray dashes, double spaces) so every sentence reads naturally.\n` +
       `2. KEEP, verbatim: \`[INFERRED]\` and \`[UNVERIFIED]\` tags (they carry real meaning for the rebuilder), ` +
-      `all prose/behavior, headings, code blocks, and any path that has NO line number (e.g. \`.mulch/config.yaml\`, ` +
-      `\`.mulch/expertise/\`) — real artifacts the rebuild must produce.\n` +
+      `all prose/behavior, headings, code blocks, and any path that has NO line number (e.g. \`.config/settings.yaml\`, ` +
+      `\`.config/templates/\`) — real artifacts the rebuild must produce.\n` +
       `3. If a sentence ONLY POINTED at the source (e.g. "the logic is at \`config.ts:191\`") and stated no ` +
       `behavior, INLINE the actual behavior by reading the source at \`${SOURCE}\` (stay grounded — do NOT invent). ` +
       `If you cannot determine it, replace the pointer with a \`[UNVERIFIED]\` note. Never leave a dangling ` +
@@ -998,11 +1094,11 @@ async function runDistill(docPaths) {
   const residual = reports.filter(Boolean).reduce((n, r) => n + (Number(r.residualCitations) || 0), 0)
   const failed = docPaths.length - reports.filter(Boolean).length
   if (residual > 0 || failed > 0) {
-    const note = `Distill: ${residual} residual citation(s) across the rebuild/ copy` +
+    const note = `Distill: ${residual} residual citation(s) across the distilled/ copy` +
       (failed ? ` and ${failed} doc(s) failed to distill` : '') + ` — the top-level cited kit is unaffected.`
     log(`⚠️  ${note}`); dropped.push(note)
   } else {
-    log(`Distill complete: ${docPaths.length} citation-free doc(s) under \`${OUT}/rebuild/\`.`)
+    log(`Distill complete: ${docPaths.length} citation-free doc(s) under \`${OUT}/distilled/\`.`)
   }
   return { docs: docPaths.length, residual, failed }
 }
@@ -1083,13 +1179,15 @@ async function saveStage(stage, patch = {}) {
   return checkpoint
 }
 
-// Shared tail. Writes the next un-written batch of feature specs; if any remain it
-// persists progress and returns resumeRequired; otherwise it runs the critic and
-// returns the final result. `partitioned` engages over-scale batching (off for a
-// normal run, so behavior there is byte-for-byte unchanged). The doc-family writers
-// (PRD/ARCHITECTURE/INDEX/ACCEPTANCE/ADR) already ran once in the pass-1 synth tail,
-// so a resume never re-authors them — this tail only writes specs then criticizes.
-async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten = [], extraCounts = {} }) {
+// Write-specs stage. Writes the next un-written batch of feature specs and returns a
+// CONTROL object: { done: true } when every spec is written (the caller proceeds to the
+// critic stage), or { done: false, result } for a resumable stop (over-scale partition,
+// token yield, or partial-failure) that the caller must RETURN verbatim. `partitioned`
+// engages over-scale batching (off for a normal run, so behavior there is byte-for-byte
+// unchanged). The doc-family writers already ran once in the synth tail, so a resume
+// never re-authors them. Critic/Distill/finalize are now SEPARATE ladder stages
+// (critiqued/distilled) driven by the main body — this helper only writes specs.
+async function runWriteSpecs({ ordered, partitioned, priorWritten = [], extraCounts = {} }) {
   phase('Write specs')
   const writtenNs = new Set(priorWritten)
 
@@ -1147,7 +1245,7 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
     if (partitioned && okThisPass.length === 0 && remaining > 0) {
       const err = `Write pass made no progress: all ${thisPass.length} write(s) failed, ${remaining} feature(s) still pending${tokenBudgetSet() ? ' (token-budget chunked run)' : ''}.`
       log(`❌ ${err}`); dropped.push(err)
-      return { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped }
+      return { done: false, result: { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped } }
     }
 
     if (remaining === 0) break // all done this pass → critic
@@ -1160,39 +1258,38 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
     if (!tokenBudgetSet() || stopForBudget || stopForAgentCap) {
       const note = `${remaining} feature spec(s) remain after this ${stopForBudget ? 'token-budget ' : ''}pass — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (nothing dropped).`
       log(`⏸️  ${note}`); dropped.push(note)
-      return {
+      return { done: false, result: {
         ok: true, outDir: OUT, resumeRequired: true,
         ...(stopForBudget ? { stoppedForBudget: true, stage: 'writing' } : {}),
         resumeArgs: { resume: true, outputDir: OUT },
         counts: { slicesPlanned: ordered.length, slicesWritten: writtenNs.size, slicesRemaining: remaining, ...extraCounts },
         truncations: dropped,
-      }
+      } }
     }
     // token budget remains → loop to the next small batch within THIS invocation
   }
 
-  const gaps = await runCritic()
+  // Every spec is written. Record the writing stage as COMPLETE (written = all build
+  // numbers) so a resume proceeds to the critic stage rather than re-entering the write
+  // loop, then hand control back to the main body's critiqued/distilled stages.
+  await saveStage('writing', { written: ordered.map(s => s.n) })
+  return { done: true }
+}
 
-  // Distill (opt-in): after the critic has validated the CITED kit, emit a citation-free mirror for
-  // the rebuilder. Runs on the final pass only (all specs written), before the checkpoint is cleared.
-  let distill = null
-  if (DISTILL) {
-    const docPaths = [
-      'ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md',
-      ...ordered.map(s => specRelPath(s)),
-      ...adrs.map((d, i) => `adr/${pad(i + 1)}-${slug(d.title)}.md`),
-    ]
-    distill = await runDistill(docPaths)
-  }
-
-  // The run is complete — remove the checkpoint so a later invocation starts fresh
-  // instead of auto-resuming a finished run.
+// finalize — assemble the run's final result object and CLEAR the checkpoint. Called
+// once at the run's NATURAL end: the terminal stage reached with no phase ceiling in
+// effect ('distilled' when DISTILL, else 'critiqued'). Extracted from the old
+// runWriteAndFinish tail so both the fresh path and a resume that SKIPPED the critic/
+// distill stages produce the same result (gaps/distill come from the checkpoint on such
+// a resume). clearIR() lives ONLY here — a phase command that stops early returns
+// pausedAfter() and deliberately leaves the checkpoint intact for the next phase.
+async function finalize({ ordered, adrs = [], gaps = [], distill = null, extraCounts = {} }) {
   await clearIR()
   return {
     ok: true, outDir: OUT, resumeRequired: false,
     counts: {
       slicesPlanned: ordered.length,
-      slicesWritten: writtenNs.size,
+      slicesWritten: ordered.length,
       adrs: adrs.length,
       gapsRemaining: gaps.length,
       gapsRemainingHumanDecision: gaps.filter(g => !g.fixable).length,
@@ -1207,7 +1304,7 @@ async function runWriteAndFinish({ ordered, adrs = [], partitioned, priorWritten
       acceptance: `${OUT}/ACCEPTANCE.md`,
       adrDir: `${OUT}/adr/`,
       risks: `${OUT}/RISKS-AND-GAPS.md`,
-      ...(distill ? { rebuildDir: `${OUT}/rebuild/` } : {}),
+      ...(distill ? { distilledDir: `${OUT}/distilled/` } : {}),
     },
     remainingGaps: gaps,
   }
@@ -1270,10 +1367,13 @@ const savedStage = checkpoint ? checkpoint.stage : null
 // ===========================================================================
 // Stage: Map — survey the repo + draft the capability inventory.
 // ===========================================================================
-let sysFacts, epics
+let sysFacts, epics, epicsTotal
 if (RESUMING && stageDone(savedStage, 'mapped')) {
   sysFacts = checkpoint.sysFacts || '{}'
   epics = checkpoint.epics || []
+  // Pre-cap total for the critic's intentional-omission scope note; fall back to the kept
+  // count for pre-epicsTotal checkpoints (⇒ no false "capabilities dropped" claim).
+  epicsTotal = checkpoint.epicsTotal ?? epics.length
   log(`Skipping map (checkpointed): ${epics.length} capability(ies).`)
 } else {
   phase('Map')
@@ -1304,16 +1404,21 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
     testFrameworks: map.testFrameworks, testPaths: map.testPaths,
     dependencyManifests: map.dependencyManifests,
   }, null, 2)
+  epicsTotal = map.epics.length
   epics = cap(map.epics, MAX_EPICS, 'epics')
   log(`Mapped ${map.epics.length} capability(ies); analyzing ${epics.length}.`)
   // Persist the scale knobs so a later resume can detect a scope MISMATCH (e.g. resuming a
   // maxEpics=5/limitSlices=3 smoke-test checkpoint with a full-run command) and refuse to silently
   // continue the smaller scope — the exact trap that produced the 5-epic Frankenstein kit.
+  // epicsTotal (pre-cap) rides along so the critic can flag an intentional maxEpics drop even on resume.
   await saveStage('mapped', {
-    source: SOURCE, fileCount: probe.fileCount, sysFacts, epics,
+    source: SOURCE, fileCount: probe.fileCount, sysFacts, epics, epicsTotal,
     scale: { maxEpics: MAX_EPICS, limitSlices: LIMIT_SLICES },
   })
 }
+// Phase ceiling: /portkit-map stops here. Placed OUTSIDE the if/else so it fires on a
+// resume that skipped the map agent too (re-running /portkit-map just re-reports).
+if (stopAfter('mapped', UNTIL)) return pausedAfter('mapped', { epics: epics.length })
 
 // ===========================================================================
 // Stage: Discover — per capability, trace slices + extract the behavioral spec.
@@ -1367,6 +1472,8 @@ if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
   await saveStage('discovered', { epicsDone: perEpicDone.map(e => e.epicId) })
   if (budgetYieldNow()) return yieldForBudget('discovered', { epicsDiscovered: perEpicDone.length })
 }
+// Phase ceiling: /portkit-discover stops here (outside the block so it fires on resume too).
+if (stopAfter('discovered', UNTIL)) return pausedAfter('discovered', { epicsDiscovered: perEpicDone.length })
 
 // ===========================================================================
 // Stage: Synthesize — dedup (the one job needing judgment); the mechanical graph
@@ -1457,6 +1564,9 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
     await saveStage('synthesized', { merges, sysFacts, slicesDiscovered, slicesOmittedForTest })
     didWorkThisTurn = true // the synth agent ran this turn
   }
+  // Phase ceiling: pause after dedup if explicitly asked (not a default command target —
+  // /portkit-synthesize stops at 'docs' — but honored if until='synthesized' is passed).
+  if (stopAfter('synthesized', UNTIL)) return pausedAfter('synthesized', { slicesDiscovered })
   // Yield only if something ran this turn (fresh synth here, or discovery earlier). On a pure
   // resume that reloaded merges without doing work, didWorkThisTurn stays false so we push on to
   // the doc family rather than yield having done nothing.
@@ -1581,6 +1691,8 @@ await agent(
   await saveStage('docs', {})
   didWorkThisTurn = true // the doc family (4 agents) ran this turn
 }
+// Phase ceiling: /portkit-synthesize stops here (after the doc family is authored).
+if (stopAfter('docs', UNTIL)) return pausedAfter('docs', { slicesDiscovered })
 if (budgetYieldNow()) return yieldForBudget('docs')
 
 // ===========================================================================
@@ -1632,6 +1744,8 @@ if (decisions.length) {
   await saveStage('adrs', { adrs: decisions })
   didWorkThisTurn = true // ADR discovery + writers ran this turn
 }
+// Phase ceiling: /portkit-adrs stops here (outside the if/else so it fires on resume too).
+if (stopAfter('adrs', UNTIL)) return pausedAfter('adrs', { adrs: decisions.length })
 if (budgetYieldNow()) return yieldForBudget('adrs', { adrs: decisions.length })
 
 // ===========================================================================
@@ -1644,33 +1758,94 @@ if (budgetYieldNow()) return yieldForBudget('adrs', { adrs: decisions.length })
 // Two independent reasons to partition the write phase into resumable passes: AGENT over-scale
 // (projected agents near the ~1000 ceiling) and a TOKEN budget (chunk to fit a subscription
 // window). Either engages small/batched writes; a token budget additionally makes each pass small.
-let partitioned
-if (RESUMING && stageDone(savedStage, 'writing') && typeof checkpoint.partitioned === 'boolean') {
-  partitioned = checkpoint.partitioned || tokenBudgetSet()
-} else {
-  const projected = projectAgents({
-    epicCount: epics.length, sliceCount: ordered.length,
-    adrCount: decisions.length, maxAdrs: MAX_ADRS, gapfillRounds: MAX_GAPFILL_ROUNDS,
-  })
-  const overScale = projected > SAFE_BUDGET
-  partitioned = overScale || tokenBudgetSet()
-  if (overScale) {
-    const note = `Over-scale: projected ~${projected} agents exceeds the safe budget (${SAFE_BUDGET}); partitioning feature-spec writing into resumable passes. Nothing dropped.`
-    log(`⚖️  ${note}`); dropped.push(note)
-  } else if (tokenBudgetSet()) {
-    const note = `Token budget in effect (~${effectiveTokenTotal()} tokens, reserve ${TOKEN_RESERVE}); writing feature specs in small resumable passes sized to the subscription window. Nothing dropped.`
-    log(`💰 ${note}`); dropped.push(note)
-  }
+const finalCounts = {
+  epics: epics.length, slicesDiscovered,
+  // Present ONLY on a test-limited run so the partial kit is unmistakable.
+  ...(slicesOmittedForTest > 0 ? { testLimited: true, slicesOmittedForTest } : {}),
 }
-// NOTE: `ordered` is deliberately NOT persisted (it is the O(slices) aggregate that
-// blew the checkpoint size budget); it is recomputed deterministically from the light
-// side-cars + persisted merges on resume. Only small state goes in the checkpoint.
-await saveStage('writing', { partitioned, adrs: decisions, written: checkpoint.written || [] })
-return await runWriteAndFinish({
-  ordered, adrs: decisions, partitioned, priorWritten: checkpoint.written || [],
-  extraCounts: {
-    epics: epics.length, slicesDiscovered,
-    // Present ONLY on a test-limited run so the partial kit is unmistakable.
-    ...(slicesOmittedForTest > 0 ? { testLimited: true, slicesOmittedForTest } : {}),
-  },
-})
+// Skip the whole write phase on a resume past the critic (specs are already on disk).
+if (!(RESUMING && stageDone(savedStage, 'critiqued'))) {
+  let partitioned
+  if (RESUMING && stageDone(savedStage, 'writing') && typeof checkpoint.partitioned === 'boolean') {
+    partitioned = checkpoint.partitioned || tokenBudgetSet()
+  } else {
+    const projected = projectAgents({
+      epicCount: epics.length, sliceCount: ordered.length,
+      adrCount: decisions.length, maxAdrs: MAX_ADRS, gapfillRounds: MAX_GAPFILL_ROUNDS,
+    })
+    const overScale = projected > SAFE_BUDGET
+    partitioned = overScale || tokenBudgetSet()
+    if (overScale) {
+      const note = `Over-scale: projected ~${projected} agents exceeds the safe budget (${SAFE_BUDGET}); partitioning feature-spec writing into resumable passes. Nothing dropped.`
+      log(`⚖️  ${note}`); dropped.push(note)
+    } else if (tokenBudgetSet()) {
+      const note = `Token budget in effect (~${effectiveTokenTotal()} tokens, reserve ${TOKEN_RESERVE}); writing feature specs in small resumable passes sized to the subscription window. Nothing dropped.`
+      log(`💰 ${note}`); dropped.push(note)
+    }
+  }
+  // NOTE: `ordered` is deliberately NOT persisted (it is the O(slices) aggregate that
+  // blew the checkpoint size budget); it is recomputed deterministically from the light
+  // side-cars + persisted merges on resume. Only small state goes in the checkpoint.
+  await saveStage('writing', { partitioned, adrs: decisions, written: checkpoint.written || [] })
+  const writeCtl = await runWriteSpecs({
+    ordered, partitioned, priorWritten: checkpoint.written || [], extraCounts: finalCounts,
+  })
+  // A resumable stop (over-scale partition, token yield, or partial-failure) — return verbatim.
+  if (!writeCtl.done) return writeCtl.result
+  // Phase ceiling: /portkit-specs stops here, after every spec is written, before the critic.
+  if (stopAfter('writing', UNTIL)) return pausedAfter('writing', { ...finalCounts, slicesWritten: ordered.length })
+}
+
+// ===========================================================================
+// Stage: Critic — grounding + completeness audit; writes RISKS-AND-GAPS.md and runs
+// the budget-bounded gap-fill loop. Skipped on a resume past this stage; the gaps
+// reload from the checkpoint so finalize can still report the counts.
+// ===========================================================================
+let gaps
+if (RESUMING && stageDone(savedStage, 'critiqued')) {
+  gaps = Array.isArray(checkpoint.gaps) ? checkpoint.gaps : []
+  log(`Skipping critic (checkpointed): ${gaps.length} gap(s).`)
+} else {
+  // Tell the critic which omissions are INTENTIONAL (limitSlices trims specs, maxEpics drops
+  // capabilities) so its gap-fill loop never "repairs" a deliberate truncation into a
+  // claimed-complete kit. '' on a full run ⇒ the critic/gap-fix prompts are byte-identical to today.
+  const scopeNote = omissionScopeNote({
+    slicesOmittedForTest, limitSlices: LIMIT_SLICES,
+    epicsKept: epics.length, epicsTotal: epicsTotal ?? epics.length,
+  })
+  gaps = await runCritic(scopeNote)
+  await saveStage('critiqued', { gaps })
+  didWorkThisTurn = true
+}
+// Phase ceiling: /portkit-critic stops here. (When distill is OFF, 'critiqued' is also
+// the natural terminal stage — but a full run passes UNTIL=null, so it falls through.)
+if (stopAfter('critiqued', UNTIL)) return pausedAfter('critiqued', { ...finalCounts, gapsRemaining: gaps.length })
+if (budgetYieldNow()) return yieldForBudget('critiqued', { ...finalCounts, gapsRemaining: gaps.length })
+
+// ===========================================================================
+// Stage: Distill (opt-in) — emit a citation-free distilled/ mirror for the weaker
+// rebuilder, after the critic has validated the cited kit. Skipped on a resume past
+// this stage. When DISTILL is off, this stage is inert and 'critiqued' is terminal.
+// ===========================================================================
+let distill = null
+if (DISTILL) {
+  if (RESUMING && stageDone(savedStage, 'distilled')) {
+    distill = checkpoint.distill || null
+    log('Skipping distill (checkpointed).')
+  } else {
+    const docPaths = [
+      'ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md',
+      ...ordered.map(s => specRelPath(s)),
+      ...decisions.map((d, i) => `adr/${pad(i + 1)}-${slug(d.title)}.md`),
+    ]
+    distill = await runDistill(docPaths)
+    await saveStage('distilled', { distill })
+    didWorkThisTurn = true
+  }
+  // 'distilled' is the terminal stage, so a ceiling of 'distilled' means "finish": fall
+  // through to finalize rather than pause (pausing would leave a completed-but-uncleared
+  // checkpoint that a plain /portkit would then have to clean up).
+}
+
+// Natural completion — assemble the final result and clear the checkpoint.
+return await finalize({ ordered, adrs: decisions, gaps, distill, extraCounts: finalCounts })

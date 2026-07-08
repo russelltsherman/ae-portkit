@@ -129,11 +129,11 @@ function makeRuntime(sc, store) {
     }
     if (label.startsWith('critic:')) return { gaps: [] }
     if (label.startsWith('distill:')) {
-      // The real agent reads <OUT>/<rel>, writes a citation-free copy to <OUT>/rebuild/<rel>, and
+      // The real agent reads <OUT>/<rel>, writes a citation-free copy to <OUT>/distilled/<rel>, and
       // reports residual `path:line` count. Record the rel path so tests can assert full coverage.
       store.distilled = store.distilled || []
       store.distilled.push(label.slice('distill:'.length))
-      return { path: `rebuild/${label.slice('distill:'.length)}`, residualCitations: store.residualPerDoc || 0 }
+      return { path: `distilled/${label.slice('distill:'.length)}`, residualCitations: store.residualPerDoc || 0 }
     }
     return 'ok' // index, acceptance, arch, prd, adr:write, gapfix — no schema, return ignored
   }
@@ -472,7 +472,7 @@ test('resume reuses on-disk side-cars instead of re-running discovery', async ()
   assert.equal(result.counts.slicesWritten, 6, 'all features written from the checkpoint + side-cars')
 })
 
-// REGRESSION (the mulch duplicate-rewrite bug): on resume, a capability whose slice
+// REGRESSION (the duplicate-rewrite bug): on resume, a capability whose slice
 // STRUCTURE is on disk (light + slices side-cars) but whose BEHAVIOR side-car is missing
 // — because its behavior agent failed on the prior pass — must re-run ONLY the behavior
 // agent. It must NOT be re-discovered: re-discovery yields a different slice set and
@@ -640,10 +640,10 @@ test('no-budget regression: an unset budget yields never and completes in a sing
 })
 
 // ===========================================================================
-// Distill: citation-free rebuild/ mirror for the weaker rebuilder (opt-in)
+// Distill: citation-free distilled/ mirror for the weaker rebuilder (opt-in)
 // ===========================================================================
 
-test('distill: opt-in emits a citation-free rebuild/ mirror of every consumer-facing doc', async () => {
+test('distill: opt-in emits a citation-free distilled/ mirror of every consumer-facing doc', async () => {
   const sc = scenario({
     epics: ['e1', 'e2'], slicesPerEpic: 2, // 4 specs
     decisions: [
@@ -662,18 +662,18 @@ test('distill: opt-in emits a citation-free rebuild/ mirror of every consumer-fa
   }
   assert.equal(store.distilled.filter(p => p.startsWith('specs/')).length, 4, 'all 4 specs distilled')
   assert.equal(store.distilled.filter(p => p.startsWith('adr/')).length, 2, 'both ADRs distilled')
-  assert.equal(result.keyDocs.rebuildDir, '/tmp/portkit-out/rebuild/')
+  assert.equal(result.keyDocs.distilledDir, '/tmp/portkit-out/distilled/')
   assert.equal(result.counts.distilledDocs, 10, '4 fixed docs + 4 specs + 2 ADRs')
   assert.equal(result.counts.residualCitations, 0)
 })
 
-test('distill: OFF by default — no rebuild/ mirror, no distill agents', async () => {
+test('distill: OFF by default — no distilled/ mirror, no distill agents', async () => {
   const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
   const store = {}
   const { result, rec } = await run({ ...BASE }, sc, store) // distill not set
   assert.ok(!rec.labels.some(l => l.startsWith('distill:')), 'no distill agents run by default')
   assert.equal(store.distilled, undefined)
-  assert.ok(!('rebuildDir' in result.keyDocs))
+  assert.ok(!('distilledDir' in result.keyDocs))
   assert.ok(!('distilledDocs' in result.counts))
 })
 
@@ -683,4 +683,190 @@ test('distill: residual citations are surfaced loudly, not hidden', async () => 
   const { result } = await run({ ...BASE, distill: true }, sc, store)
   assert.equal(result.counts.residualCitations, 10, '2 residual × 5 docs, aggregated')
   assert.ok(result.truncations.some(t => /residual citation/.test(t)), 'residuals flagged in truncations')
+})
+
+// ===========================================================================
+// Per-phase commands: the `until` ceiling stops after a chosen stage (review /
+// dev-debugging), leaves the checkpoint intact, and never runs a later phase.
+// ===========================================================================
+// Each phase command is a thin wrapper that sets `until: '<stage>'`; a paused result
+// carries { paused: true, stage, nextCommand } and (crucially) does NOT clear the IR,
+// so the next command resumes from it.
+
+test('until=mapped: stops after Map, runs no discovery, keeps the checkpoint', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'mapped' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'mapped')
+  assert.equal(result.nextCommand, '/portkit-discover')
+  assert.ok(rec.labels.includes('map:survey'), 'Map ran')
+  assert.ok(!rec.labels.some(l => l.startsWith('discover:')), 'discovery must NOT run past the ceiling')
+  assert.ok(!rec.labels.includes('synthesize'))
+  assert.ok(!rec.labels.includes('ir:clear'), 'a phase pause must NOT clear the checkpoint')
+  assert.ok(store.ir && store.ir.stage === 'mapped', 'checkpoint kept at the map stage')
+})
+
+test('until=discovered: stops after Discover, before synthesis, checkpoint kept', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'discovered' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'discovered')
+  assert.ok(rec.labels.some(l => l.startsWith('discover:')), 'discovery ran')
+  assert.ok(!rec.labels.includes('synthesize'), 'synthesis must not run past the ceiling')
+  assert.ok(!rec.labels.includes('ir:clear'))
+  assert.equal(store.ir.stage, 'discovered')
+})
+
+test('until=docs: stops after the doc family, before ADR discovery', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2, decisions: [{ id: 'd1', title: 'X', evidence: ['a.go:1'] }] })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'docs' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'docs')
+  for (const lbl of ['index', 'acceptance', 'arch', 'prd']) assert.ok(rec.labels.includes(lbl), `${lbl} authored`)
+  assert.ok(!rec.labels.includes('adr:discover'), 'ADRs must not run past the ceiling')
+  assert.ok(!rec.labels.some(l => l.startsWith('slice:')), 'no feature specs written yet')
+  assert.equal(store.ir.stage, 'docs')
+})
+
+test('until=adrs: stops after ADRs, before any feature spec is written', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2, decisions: [{ id: 'd1', title: 'X', evidence: ['a.go:1'] }] })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'adrs' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'adrs')
+  assert.ok(rec.labels.includes('adr:discover'), 'ADR discovery ran')
+  assert.ok(!rec.labels.some(l => l.startsWith('slice:')), 'no feature specs written past the ceiling')
+  assert.ok(!rec.labels.some(l => l.startsWith('critic:')))
+  assert.equal(store.ir.stage, 'adrs')
+})
+
+test('until=writing: stops after every spec is written, before the critic', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 }) // 6 specs
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'writing' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'writing')
+  assert.equal(result.nextCommand, '/portkit-critic')
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6], 'all specs written')
+  assert.ok(!rec.labels.some(l => l.startsWith('critic:')), 'critic must not run past the ceiling')
+  assert.ok(!rec.labels.includes('ir:clear'))
+  assert.equal(store.ir.stage, 'writing')
+})
+
+test('until=critiqued: stops after the critic, persists gaps, runs no distill, keeps checkpoint', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 2 })
+  const store = {}
+  const { result, rec } = await run({ ...BASE, until: 'critiqued' }, sc, store)
+
+  assert.equal(result.paused, true)
+  assert.equal(result.stage, 'critiqued')
+  assert.ok(rec.labels.includes('critic:1'), 'critic ran')
+  assert.ok(!rec.labels.some(l => l.startsWith('distill:')), 'distill must not run past the ceiling')
+  assert.ok(!rec.labels.includes('ir:clear'), 'critic pause keeps the checkpoint for an optional distill phase')
+  assert.equal(store.ir.stage, 'critiqued')
+  assert.ok(Array.isArray(store.ir.gaps), 'gaps persisted so a resume can report them')
+})
+
+test('phase-by-phase sequence produces the SAME kit as one full run, and distill finalizes/clears', async () => {
+  const sc = scenario({
+    epics: ['e1', 'e2'], slicesPerEpic: 2, // 4 specs
+    decisions: [{ id: 'd1', title: 'Persist as JSONL', evidence: ['x.go:1'] }],
+  })
+  const store = {}
+  // Walk the ceilings in order, sharing the checkpoint (auto-resume, no fresh flag) —
+  // exactly what /portkit-map → … → /portkit-critic do.
+  for (const until of ['mapped', 'discovered', 'docs', 'adrs', 'writing', 'critiqued']) {
+    const { result } = await run({ ...BASE, until }, sc, store)
+    assert.equal(result.paused, true, `paused at ${until}`)
+    assert.equal(result.stage, until)
+    assert.notEqual(store.ir, undefined, `checkpoint kept after ${until}`)
+  }
+  // Terminal /portkit-distill (distill:true, no ceiling) runs to natural completion.
+  const { result: fin, rec } = await run({ ...BASE, distill: true }, sc, store)
+  assert.equal(fin.ok, true)
+  assert.equal(fin.resumeRequired, false)
+  assert.ok(rec.labels.some(l => l.startsWith('distill:')), 'distill ran on the terminal phase')
+  assert.equal(store.ir, undefined, 'checkpoint cleared at natural completion')
+  assert.deepEqual([...store.written].sort((a, b) => a - b), [1, 2, 3, 4], 'every feature written exactly once across the phases')
+  assert.equal(fin.counts.slicesWritten, 4)
+  assert.equal(fin.counts.adrs, 1)
+})
+
+test('a full /portkit run (no until) is unaffected: never pauses, still clears the checkpoint', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 2 })
+  const store = {}
+  const { result } = await run({ ...BASE }, sc, store) // no until
+  assert.ok(!('paused' in result), 'no ceiling => never pauses')
+  assert.equal(result.resumeRequired, false)
+  assert.equal(store.ir, undefined, 'full run clears the checkpoint as before')
+})
+
+test('default output dir uses the _portkit suffix (never _recreation)', async () => {
+  const sc = scenario({ epics: ['e1'], slicesPerEpic: 1 })
+  const store = {}
+  // No outputDir passed -> the workflow derives it from the input/cwd with a _portkit suffix.
+  const { result } = await run({ inputDir: '.', until: 'mapped' }, sc, store)
+  assert.equal(result.paused, true)
+  assert.match(result.outDir, /_portkit$/, 'default output dir ends with _portkit')
+  assert.ok(!/_recreation/.test(result.outDir), 'the old _recreation suffix is gone')
+})
+
+// --- critic respects INTENTIONAL test-scope omissions (limitSlices / maxEpics) ---
+// The critic must be told a DEV/TEST truncation is deliberate, so its gap-fill loop never
+// "repairs" it by regenerating the omitted specs (which would silently turn a partial test
+// kit into a claimed-complete one). Full runs must stay byte-identical (no clause).
+
+function criticPromptOf(rec) {
+  const c = rec.prompts.find(p => p.label === 'critic:1')
+  return c ? c.prompt : ''
+}
+
+test('limitSlices run: critic prompt carries the intentional-omission scope clause', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 }) // 6 slices
+  const store = {}
+  const { result, rec } = await run({ ...BASE, limitSlices: 3 }, sc, store)
+  assert.equal(result.counts.slicesWritten, 3)
+  assert.equal(result.counts.slicesOmittedForTest, 3)
+  const cp = criticPromptOf(rec)
+  assert.match(cp, /INTENTIONAL TEST-SCOPE/)
+  assert.match(cp, /3 feature spec\(s\) were INTENTIONALLY omitted/)
+  assert.match(cp, /limitSlices=3/)
+})
+
+test('maxEpics run: critic prompt reports the dropped capabilities as intentional', async () => {
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 1 }) // 3 epics discovered
+  const store = {}
+  const { rec } = await run({ ...BASE, maxEpics: 1 }, sc, store)
+  const cp = criticPromptOf(rec)
+  assert.match(cp, /INTENTIONAL TEST-SCOPE/)
+  assert.match(cp, /2 capability\(ies\) were INTENTIONALLY dropped/)
+  assert.match(cp, /1 of 3/)
+})
+
+test('normal full run: critic prompt has NO scope clause (byte-identical-when-unset)', async () => {
+  const sc = scenario({ epics: ['e1', 'e2'], slicesPerEpic: 3 })
+  const store = {}
+  const { rec } = await run({ ...BASE }, sc, store)
+  assert.ok(!/INTENTIONAL TEST-SCOPE/.test(criticPromptOf(rec)), 'full run must not carry the test-scope clause')
+})
+
+test('maxEpics scope clause survives a resume into the critic stage (epicsTotal persisted)', async () => {
+  // Pass 1: stop right after mapping, with maxEpics capping 3 -> 1. This persists epicsTotal.
+  const sc = scenario({ epics: ['e1', 'e2', 'e3'], slicesPerEpic: 1 })
+  const store = {}
+  await run({ ...BASE, maxEpics: 1, until: 'mapped' }, sc, store)
+  assert.equal(store.ir.epicsTotal, 3, 'pre-cap epic total is persisted in the checkpoint')
+  // Pass 2: resume to completion (map is skipped) — the clause must still reflect the cap.
+  const { rec } = await run({ ...BASE, maxEpics: 1 }, sc, store)
+  const cp = criticPromptOf(rec)
+  assert.match(cp, /2 capability\(ies\) were INTENTIONALLY dropped/)
+  assert.match(cp, /1 of 3/)
 })
