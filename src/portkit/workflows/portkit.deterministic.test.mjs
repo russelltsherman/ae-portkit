@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote', 'checkDocStructure', 'docStructure']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -623,6 +623,92 @@ test('doc-family templates are all defined with their signature headings', () =>
 test('regression: the old free-form "Include, in this order" checklist is gone', () => {
   assert.ok(!FULL_SRC.includes('Include, in this order:'),
     'writers must fill the rigid skeleton, not a free-form content checklist')
+})
+
+// --- checkDocStructure (frontmatter + section-order conformance of GENERATED docs) ---------
+// The comparison is deterministic pure JS; only the extraction (what headings a doc has) is
+// agent-performed at runtime. A conformant doc yields no violations; each defect kind is caught.
+
+// Build a perfectly-conformant extraction for a docType straight from the source-of-truth table,
+// so these tests can never drift from DOC_STRUCTURE.
+function conformant(docType) {
+  const { docStructure } = loadDeterministic()
+  const spec = docStructure()[docType]
+  return { path: `docs/${docType}.md`, frontmatterKeys: [...spec.frontmatter], headings: [...spec.headings] }
+}
+
+test('checkDocStructure: a conformant doc yields no violations', () => {
+  const { checkDocStructure } = loadDeterministic()
+  for (const docType of ['slice-spec', 'adr', 'prd', 'architecture', 'index', 'acceptance', 'glossary']) {
+    assert.deepEqual(checkDocStructure(docType, conformant(docType)), [], `${docType} conformant`)
+  }
+})
+
+test('checkDocStructure: unknown docType is not flagged', () => {
+  const { checkDocStructure } = loadDeterministic()
+  assert.deepEqual(checkDocStructure('README', { headings: ['Whatever'] }), [])
+})
+
+test('checkDocStructure: a missing frontmatter field is a missing-frontmatter violation', () => {
+  const { checkDocStructure } = loadDeterministic()
+  const doc = conformant('slice-spec')
+  doc.frontmatterKeys = doc.frontmatterKeys.filter(k => k !== 'Depends on')
+  const v = checkDocStructure('slice-spec', doc)
+  assert.equal(v.length, 1)
+  assert.equal(v[0].kind, 'missing-frontmatter')
+  assert.match(v[0].detail, /Depends on/)
+})
+
+test('checkDocStructure: a dropped section is a missing-heading violation', () => {
+  const { checkDocStructure } = loadDeterministic()
+  const doc = conformant('adr')
+  doc.headings = doc.headings.filter(h => h !== 'Consequences')
+  const v = checkDocStructure('adr', doc)
+  assert.equal(v.length, 1)
+  assert.equal(v[0].kind, 'missing-heading')
+  assert.match(v[0].detail, /## Consequences/)
+})
+
+test('checkDocStructure: reordered but complete sections are a section-order violation', () => {
+  const { checkDocStructure } = loadDeterministic()
+  const doc = conformant('slice-spec')
+  // swap the first two required sections; all present, wrong order
+  const h = doc.headings
+  ;[h[0], h[1]] = [h[1], h[0]]
+  const v = checkDocStructure('slice-spec', doc)
+  assert.equal(v.length, 1)
+  assert.equal(v[0].kind, 'section-order')
+})
+
+test('checkDocStructure: extra/unknown headings are NOT flagged (content varies)', () => {
+  const { checkDocStructure } = loadDeterministic()
+  const doc = conformant('acceptance')
+  doc.headings = [...doc.headings, 'Appendix']
+  assert.deepEqual(checkDocStructure('acceptance', doc), [])
+})
+
+test('checkDocStructure: normalizes `**`/`##`/`:` decoration the reader may leave on', () => {
+  const { checkDocStructure } = loadDeterministic()
+  const doc = {
+    path: 'adr/ADR-0001-x.md',
+    frontmatterKeys: ['**ADR ID:**', '**Status:**'],
+    headings: ['## Context & Problem', '## Decision Drivers', '## Considered Options',
+      '## Decision Outcome', '## Consequences', '## Rationale'],
+  }
+  assert.deepEqual(checkDocStructure('adr', doc), [])
+})
+
+test('drift guard: every DOC_STRUCTURE field/heading appears in a template constant', () => {
+  const { docStructure } = loadDeterministic()
+  const table = docStructure()
+  for (const [docType, spec] of Object.entries(table)) {
+    for (const key of spec.frontmatter) {
+      assert.ok(FULL_SRC.includes(`**${key}:**`), `${docType} frontmatter \`**${key}:**\` must exist in a template`)
+    }
+    for (const h of spec.headings) {
+      assert.ok(FULL_SRC.includes(`## ${h}`), `${docType} heading \`## ${h}\` must exist in a template`)
+    }
+  }
 })
 
 // --- budgetExhausted (token/subscription-window voluntary-yield decision) ---

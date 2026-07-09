@@ -127,7 +127,25 @@ function makeRuntime(sc, store) {
       store.written.add(n)
       return { path: `doc-${n}.md`, ok: true, selfContained: true }
     }
-    if (label.startsWith('critic:')) return { gaps: [] }
+    if (label.startsWith('critic:')) {
+      // Optionally simulate the critic EXTRACTING each doc's structure. On the first round a
+      // malformed scenario reports a slice spec missing its last section (a `missing-heading`
+      // that checkDocStructure() turns into a fixable malformed-structure gap); later rounds
+      // report it conformant so the gap-fill loop converges.
+      const round = Number(label.split(':')[1])
+      if (store.malformedStructure && round === 1) {
+        return {
+          gaps: [],
+          docStructures: [{
+            path: 'specs/SL-0001-x.md', docType: 'slice-spec',
+            frontmatterKeys: ['Slice ID', 'Build #', 'Feature', 'Status', 'Depends on'],
+            // 'Shared Conventions' dropped ⇒ one missing-heading violation
+            headings: ['Summary', 'Behavior Thread', 'Interface & Contract', 'Acceptance Criteria', 'Build Steps'],
+          }],
+        }
+      }
+      return { gaps: [], docStructures: store.conformantStructures || [] }
+    }
     if (label.startsWith('distill:')) {
       // The real agent reads <OUT>/<rel>, writes a citation-free copy to <OUT>/distilled/<rel>, and
       // reports residual `path:line` count. Record the rel path so tests can assert full coverage.
@@ -232,6 +250,38 @@ test('canonical ids + rigid skeleton reach the writers (SL-/FEAT-/ADR-, house st
   assert.match(firstSliceWrite, /specs\/SL-0001-e1-h0\.md/, 'spec filename is <SliceID>-<handle>.md')
   assert.match(idx, /specs\/SL-0001-e1-h0\.md/, 'INDEX links the same id+handle filename')
   assert.match(prompt(p => p.label === 'adr:write:1'), /adr\/ADR-0001-/, 'ADR filename is ADR-<NNNN>-<handle>.md')
+})
+
+test('critic prompt asks for the per-doc STRUCTURE REPORT (docStructures extraction)', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1 })
+  const store = {}
+  const { rec } = await run({ ...BASE }, sc, store)
+  const critic = rec.prompts.find(p => p.label === 'critic:1')?.prompt || ''
+  assert.match(critic, /STRUCTURE REPORT/, 'critic is told to report per-doc structure')
+  assert.match(critic, /docStructures/, 'the docStructures field is named')
+  assert.match(critic, /malformed-structure/, 'the new defect kind is described')
+})
+
+test('conformant docs produce no malformed-structure gap and no gap-fill', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = {} // critic mock returns empty docStructures ⇒ nothing to flag
+  const { result, rec } = await run({ ...BASE }, sc, store)
+  assert.equal(result.ok, true)
+  assert.equal(result.counts.gapsRemaining, 0, 'no structural gaps on a conformant kit')
+  assert.ok(!rec.labels.some(l => l.startsWith('gapfix:')), 'no gap-fill triggered')
+})
+
+test('a doc missing a required section is caught, auto-fixed via gap-fill', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = { malformedStructure: true } // critic:1 reports SL-0001 missing its last section
+  const { result, rec } = await run({ ...BASE }, sc, store)
+  assert.equal(result.ok, true)
+  // the deterministic check turned the missing heading into a fixable gap that drove the loop
+  assert.ok(rec.labels.some(l => l.startsWith('gapfix:')), 'gap-fill ran on the malformed doc')
+  // the gap-fix agent was handed the malformed-structure gap for SL-0001
+  const gapfix = rec.prompts.find(p => p.label.startsWith('gapfix:'))?.prompt || ''
+  assert.match(gapfix, /malformed-structure/, 'gap-fix agent receives the structural gap')
+  assert.match(gapfix, /SL-0001-x\.md/, 'gap-fix agent is pointed at the offending doc')
 })
 
 test('dependsOn is rendered as canonical Slice IDs, never the raw discovery key', async () => {

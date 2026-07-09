@@ -8,7 +8,8 @@ allowed-tools: Bash, Workflow
 
 Run the PortKit pipeline **up to and including the Critic phase**, then **pause**. The critic audits
 whether a weaker model could rebuild from the kit alone — unresolved citations, thin/missing coverage,
-`[INFERRED]` misuse, non-self-contained specs, dangling deps — writes `<output>/RISKS-AND-GAPS.md`, and
+`[INFERRED]` misuse, non-self-contained specs, dangling deps, malformed document structure (frontmatter
++ required-section conformance, checked deterministically) — writes `<output>/RISKS-AND-GAPS.md`, and
 runs a budget-bounded gap-fill loop (`maxGapfillRounds`, default 2).
 
 Requires the slice specs; advances the ladder to here if the checkpoint is earlier. See `/portkit`

@@ -69,6 +69,7 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
 | 1 | Full doc set produced | `PRD.md`, `ARCHITECTURE.md`, `INDEX.md`, `ACCEPTANCE.md`, `RISKS-AND-GAPS.md`, ≥1 `specs/NNNN-*.md` all exist under the fixture's `_portkit/` dir |
 | 2 | Grounding | Sample `path:line` citations in ARCHITECTURE.md and the slice specs; each resolves to real source |
 | 3 | Slice-spec integrity | `INDEX.md` order is topological; pick 3 slice specs — each is end-to-end, self-contained, has acceptance criteria, references only ARCHITECTURE.md (no dangling cross-slice refs) |
+| 3b | Structural conformance | Every generated doc carries its template's metadata frontmatter fields and required `##` sections in order; the Critic flags any drop/rename/reorder as a `malformed-structure` gap (deterministic check), auto-fixes what it can, and lists the rest in `RISKS-AND-GAPS.md` |
 | 4 | Acceptance spec | `ACCEPTANCE.md` criteria trace back to actual fixture tests; thin areas are flagged |
 | 5 | Truncations surfaced | The workflow result's `truncations` array and `RISKS-AND-GAPS.md` name anything capped (no silent drops) |
 | 6 | ADRs present + evidenced | ≥1 `adr/NNNN-*.md`, each in MADR form with status `Reconstructed`, a `path:line`-evidenced decision, and rationale/"why" tagged `[INFERRED]` |

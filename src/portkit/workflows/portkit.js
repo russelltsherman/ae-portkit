@@ -562,6 +562,84 @@ function omissionScopeNote({ slicesOmittedForTest = 0, limitSlices = 0, features
     `points at an intentionally-omitted slice is expected and MUST NOT be flagged. Editing INDEX/ACCEPTANCE to claim the full slice ` +
     `set is present is FORBIDDEN — the partial scope must remain accurately reported.`
 }
+
+// DOC_STRUCTURE — PURE data. The required SHAPE of every kit document keyed by docType: the
+// frontmatter fields its metadata header must carry, and the `##` section headings it must contain
+// IN ORDER. This is the machine-checkable projection of the prose skeletons (SLICE_SPEC_TEMPLATE,
+// ADR_TEMPLATE, … which live OUTSIDE the fence). The two are kept in lockstep by a drift-guard test
+// that asserts every field/heading here also appears in its template constant. Glossary has no `##`
+// sections (it is a fixed term table), so only its frontmatter is checkable here.
+const DOC_STRUCTURE = {
+  'slice-spec': {
+    frontmatter: ['Slice ID', 'Build #', 'Feature', 'Status', 'Depends on'],
+    headings: ['Summary', 'Behavior Thread', 'Interface & Contract', 'Acceptance Criteria', 'Build Steps', 'Shared Conventions'],
+  },
+  adr: {
+    frontmatter: ['ADR ID', 'Status'],
+    headings: ['Context & Problem', 'Decision Drivers', 'Considered Options', 'Decision Outcome', 'Consequences', 'Rationale'],
+  },
+  prd: {
+    frontmatter: ['Status'],
+    headings: ['Overview', 'Goals', 'Non-Goals', 'Success Metrics', 'Users & Personas', 'Functional Requirements', 'Constraints & Assumptions'],
+  },
+  architecture: {
+    frontmatter: ['Status'],
+    headings: ['Tech Stack & Build/Test', 'Component Inventory', 'Data Model & Vocabulary', 'Data Flows', 'Cross-Cutting Concerns'],
+  },
+  index: {
+    frontmatter: [],
+    headings: ['Features & Slices', 'Recommended Build Order', 'Merged Slices'],
+  },
+  acceptance: {
+    frontmatter: [],
+    headings: ['Coverage Summary', 'Acceptance Criteria by Feature'],
+  },
+  glossary: {
+    frontmatter: ['Status'],
+    headings: [],
+  },
+}
+// docStructure — PURE accessor so tests (which eval only this fenced region) can read the table.
+function docStructure() { return DOC_STRUCTURE }
+
+// checkDocStructure — PURE. Given a docType and the structure a reader EXTRACTED from one generated
+// document ({ frontmatterKeys, headings, path }), return the conformance violations against
+// DOC_STRUCTURE. Three kinds: a required `**Field:**` absent from the metadata header
+// (`missing-frontmatter`), a required `## Section` absent (`missing-heading`), or the required
+// sections present but out of the mandated order (`section-order`). Extra/unknown headings are NOT
+// flagged — content legitimately varies. An unknown docType returns [] (nothing to check). Inputs are
+// normalized (strip `*`/`#`/trailing `:`, trim) so the reader need not report them pre-cleaned.
+function checkDocStructure(docType, doc) {
+  const spec = DOC_STRUCTURE[docType]
+  if (!spec) return []
+  const d = doc || {}
+  const path = d.path || ''
+  const normFm = s => String(s == null ? '' : s).replace(/\*/g, '').replace(/:\s*$/, '').trim()
+  const normH = s => String(s == null ? '' : s).replace(/^#+\s*/, '').trim()
+  const fmGot = new Set((d.frontmatterKeys || []).map(normFm).filter(Boolean))
+  const headGot = (d.headings || []).map(normH).filter(Boolean)
+  const headSet = new Set(headGot)
+  const violations = []
+  for (const key of spec.frontmatter) {
+    if (!fmGot.has(key)) violations.push({ docType, path, kind: 'missing-frontmatter', detail: `missing metadata field \`**${key}:**\`` })
+  }
+  for (const h of spec.headings) {
+    if (!headSet.has(h)) violations.push({ docType, path, kind: 'missing-heading', detail: `missing required section \`## ${h}\`` })
+  }
+  // Order check runs only over the required headings that ARE present (missing ones are already
+  // reported): their positions in the actual document must be strictly increasing.
+  const present = spec.headings.filter(h => headSet.has(h))
+  let last = -1, outOfOrder = false
+  for (const h of present) {
+    const idx = headGot.indexOf(h)
+    if (idx <= last) { outOfOrder = true; break }
+    last = idx
+  }
+  if (present.length > 1 && outOfOrder) {
+    violations.push({ docType, path, kind: 'section-order', detail: `sections out of order; required order: ${spec.headings.map(h => `## ${h}`).join(' → ')}` })
+  }
+  return violations
+}
 // </portkit:deterministic>
 
 // Bounded-concurrency fan-out. Same contract as parallel() — order-stable, never
@@ -884,10 +962,24 @@ const CRITIC = {
         type: 'object',
         required: ['kind', 'detail'],
         properties: {
-          kind: { type: 'string', description: 'unresolved-citation | thin-coverage | inference-as-fact | not-self-contained | missing | other' },
+          kind: { type: 'string', description: 'unresolved-citation | thin-coverage | inference-as-fact | not-self-contained | malformed-structure | missing | other' },
           detail: { type: 'string' },
           where: { type: 'string', description: 'doc path or slice id' },
           fixable: { type: 'boolean', description: 'can an agent fix this without human input?' },
+        },
+      },
+    },
+    // Per-document structure the critic EXTRACTED, fed to the deterministic checkDocStructure() check.
+    docStructures: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['path', 'docType'],
+        properties: {
+          path: { type: 'string', description: 'the doc path under OUT' },
+          docType: { type: 'string', description: 'slice-spec | adr | prd | architecture | index | acceptance | glossary' },
+          frontmatterKeys: { type: 'array', items: { type: 'string' }, description: 'the `**Key:**` metadata labels present, key text only' },
+          headings: { type: 'array', items: { type: 'string' }, description: 'the `##` section titles WITHOUT `##`, in document order' },
         },
       },
     },
@@ -1167,7 +1259,7 @@ async function discoverFeature(feature, sysFacts) {
 async function runCritic(scopeNote = '') {
   phase('Critic')
   const scopePrefix = scopeNote ? `${scopeNote}\n\n` : '' // '' on a full run ⇒ prompts byte-identical to today
-  function criticPrompt(round, prior) {
+  function criticPrompt(round, prior, deterministic) {
     return scopePrefix +
       `You are the PortKit CRITIC. Audit the generated recreation kit under \`${OUT}\` for whether a LESS ` +
       `CAPABLE local model could rebuild the project from it ALONE.\n\nCheck for:\n` +
@@ -1176,13 +1268,38 @@ async function runCritic(scopeNote = '') {
       `- \`[INFERRED]\` misuse: an inference (goal, metric, rationale, "why") asserted as observed fact, OR an ` +
       `observed fact left uncited. Check PRD.md and every adr/*.md especially.\n` +
       `- Slice specs that are NOT actually self-contained or not end-to-end testable.\n` +
+      `- Document STRUCTURE: every kit doc is generated from a FIXED template, so a dropped, renamed, or ` +
+      `reordered \`##\` section — or a missing \`**Field:**\` in the metadata header — is a \`malformed-structure\` defect.\n` +
       `- Missing pieces (a feature with no slice spec, a dangling dependsOn, a spec with no acceptance criteria).\n\n` +
+      `STRUCTURE REPORT (required): in \`docStructures\`, list EVERY kit document you inspected as ` +
+      `{ path, docType, frontmatterKeys, headings }. \`docType\` is one of ` +
+      `slice-spec (specs/*.md) | adr (adr/*.md) | prd (PRD.md) | architecture (ARCHITECTURE.md) | ` +
+      `index (INDEX.md) | acceptance (ACCEPTANCE.md) | glossary (GLOSSARY.md). ` +
+      `\`frontmatterKeys\` = the bold \`**Key:**\` labels in the metadata header (key text only, e.g. "Slice ID", "Build #"). ` +
+      `\`headings\` = the document's \`##\` section titles WITHOUT the \`##\`, in the exact order they appear. ` +
+      `Report faithfully what the file actually contains — a deterministic check compares this to the required skeleton.\n\n` +
       (prior ? `Previously reported gaps that fix agents attempted:\n${prior}\n\n` : '') +
+      (deterministic ? `A DETERMINISTIC structural check ALSO flagged these conformance violations — record each in \`${OUT}/RISKS-AND-GAPS.md\`:\n${deterministic}\n\n` : '') +
       `Append findings to \`${OUT}/RISKS-AND-GAPS.md\` (create if absent; this is round ${round}). ` +
       `Mark each gap fixable=true only if an agent could resolve it WITHOUT human input.\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn the gaps.`
   }
-  let critic = await agent(criticPrompt(1, null), { schema: CRITIC, phase: 'Critic', label: 'critic:1' })
-  let gaps = (critic && critic.gaps) || []
+  // Deterministic structural gaps: run checkDocStructure() over the structure the critic EXTRACTED.
+  // Computed in JS (not LLM-judged) so a dropped/reordered section is caught reliably; each becomes a
+  // fixable `malformed-structure` gap that drives the existing gap-fill loop.
+  function structuralGaps(critic) {
+    const docs = (critic && critic.docStructures) || []
+    const out = []
+    for (const d of docs) {
+      for (const v of checkDocStructure(d && d.docType, d)) {
+        const where = (d && d.path) || v.path || (d && d.docType) || ''
+        out.push({ kind: 'malformed-structure', detail: `${v.detail}${where ? ` in \`${where}\`` : ''}`, where, fixable: true })
+      }
+    }
+    return out
+  }
+  let critic = await agent(criticPrompt(1, null, null), { schema: CRITIC, phase: 'Critic', label: 'critic:1' })
+  let structural = structuralGaps(critic)
+  let gaps = [...((critic && critic.gaps) || []), ...structural]
   let round = 1
   while (
     gaps.some(g => g.fixable) &&
@@ -1198,14 +1315,19 @@ async function runCritic(scopeNote = '') {
       `recreation kit). Read the source at \`${SOURCE}\` as needed, but you MUST NOT create, modify, or delete ANY ` +
       `file outside \`${OUT}\` — never touch the source tree. If the gap is thin/missing coverage in the SOURCE's ` +
       `own tests, do NOT add tests to the source; instead flag it clearly in \`${OUT}/ACCEPTANCE.md\` and ` +
-      `\`${OUT}/RISKS-AND-GAPS.md\`.\n\nGAP: ${JSON.stringify(g)}\n\n${GROUND_RULE}\n\n${INFER_RULE}`,
+      `\`${OUT}/RISKS-AND-GAPS.md\`. If the gap is \`malformed-structure\`, restore the exact template heading or ` +
+      `metadata field IN PLACE (correct order, no content invented); if you cannot, record it in \`${OUT}/RISKS-AND-GAPS.md\`.` +
+      `\n\nGAP: ${JSON.stringify(g)}\n\n${GROUND_RULE}\n\n${INFER_RULE}`,
       { phase: 'Critic', label: `gapfix:${round}:${i + 1}` }
     )))
+    // Carry the structural violations into the next audit so, fixed or not, they are recorded in RISKS.
+    const priorStructural = structural.length ? JSON.stringify(structural, null, 2) : null
     critic = await agent(
-      criticPrompt(round, JSON.stringify(fixable, null, 2)),
+      criticPrompt(round, JSON.stringify(fixable, null, 2), priorStructural),
       { schema: CRITIC, phase: 'Critic', label: `critic:${round}` }
     )
-    gaps = (critic && critic.gaps) || []
+    structural = structuralGaps(critic)
+    gaps = [...((critic && critic.gaps) || []), ...structural]
   }
   return gaps
 }

@@ -111,8 +111,8 @@ specialist agents:
 4. **ADRs** — discover architecturally significant decisions (each with `path:line` evidence), write
    one MADR-style ADR each.
 5. **Write specs** — one self-contained, self-testing slice spec per unit.
-6. **Critic** — grounding + completeness audit → `RISKS-AND-GAPS.md`, with a budget-bounded gap-fill
-   loop.
+6. **Critic** — grounding + completeness audit (including a deterministic frontmatter + required-section
+   conformance check on every generated doc) → `RISKS-AND-GAPS.md`, with a budget-bounded gap-fill loop.
 
 ### Tuning knobs (optional `args`)
 
