@@ -498,10 +498,15 @@ function findSourceCitations(text) {
 //   - behaviorOnly: reload ∩ missing behavior.json  -> behavior re-run only (no re-discovery)
 //   - discover:     no light.json                   -> full discovery (never analyzed yet)
 function planResume(epics, scan) {
-  const byId = new Map((scan || []).map(e => [e && e.id, e]))
+  // Side-car filenames are slug-lowercased (slicesCarPath -> slug(epicId)), so the resume-scan
+  // agent reports lowercase ids ("cap-init") while checkpoint epic ids are uppercase ("CAP-INIT").
+  // Match case-insensitively so resume actually reloads durable side-cars instead of dropping every
+  // capability into re-discovery (which, past the 'discovered' stage, yieldszero slices).
+  const norm = x => String(x || '').toLowerCase()
+  const byId = new Map((scan || []).map(e => [e && norm(e.id), e]))
   const reload = [], behaviorOnly = [], discover = []
   for (const e of (epics || [])) {
-    const s = byId.get(e.id)
+    const s = byId.get(norm(e.id))
     if (s && s.hasLight) {
       reload.push(e.id)
       if (!s.hasBehavior) behaviorOnly.push(e.id)
