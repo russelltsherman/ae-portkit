@@ -1,5 +1,5 @@
 ---
-description: PortKit phase 2 — trace each capability into vertical slices and extract acceptance criteria, then stop.
+description: PortKit phase 2 — trace each feature into vertical slices and extract acceptance criteria, then stop.
 argument-hint: [input-dir] [--input <dir>] [--output <dir>]
 allowed-tools: Bash, Workflow
 ---
@@ -7,9 +7,9 @@ allowed-tools: Bash, Workflow
 # /portkit-discover
 
 Run the PortKit pipeline **up to and including the Discover phase**, then **pause**. For each
-capability, one agent traces it end-to-end into fine **vertical slices** (features) and another
-extracts **acceptance criteria** from the existing tests. Heavy analysis is written to per-capability
-side-car files under `<output>/.portkit/epics/`.
+feature, one agent traces it end-to-end into fine **vertical slices** (slices) and another
+extracts **acceptance criteria** from the existing tests. Heavy analysis is written to per-feature
+side-car files under `<output>/.portkit/features/`.
 
 If no checkpoint exists yet it auto-runs Map first, then Discover (resume is forgiving — a later phase
 command simply advances the ladder from the start). See `/portkit` for the full knob reference and
@@ -35,7 +35,7 @@ Resolve the SAME output dir used by the earlier phase so the shared checkpoint i
    ```
 
 3. **Handle the result:**
-   - `paused: true` — report the discovered slice/capability counts and tell the user to review the
+   - `paused: true` — report the discovered slice/feature counts and tell the user to review the
      side-cars, then run **`/portkit-synthesize`** to continue.
    - `stoppedForBudget: true` / `resumeRequired: true` — discovery was chunked to fit a token window
      (or interrupted). Re-run `/portkit-discover` (or `/loop` it) until it pauses at `discovered`.

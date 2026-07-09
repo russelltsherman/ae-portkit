@@ -1,5 +1,5 @@
 ---
-description: PortKit phase 1 — survey the codebase and draft the capability inventory, then stop for review.
+description: PortKit phase 1 — survey the codebase and draft the feature inventory, then stop for review.
 argument-hint: [input-dir] [--input <dir>] [--output <dir>] [--fresh]
 allowed-tools: Bash, Workflow
 ---
@@ -7,7 +7,7 @@ allowed-tools: Bash, Workflow
 # /portkit-map
 
 Run **only the Map phase** of the PortKit pipeline: a single agent surveys the codebase (languages,
-build system, test frameworks, dependency manifests) and drafts the **capability inventory** — the
+build system, test frameworks, dependency manifests) and drafts the **feature inventory** — the
 coarse, externally-observable behaviors the system delivers. The run then **pauses** so you can
 review the inventory before discovery fans out.
 
@@ -42,6 +42,6 @@ Parse them as `[input-dir] [--input <dir>] [--output <dir>]` exactly as `/portki
    Pass `fresh: true` if `--fresh` was given.
 
 3. **When it returns `paused: true`**, report: the run stopped after the **Map** phase, the number of
-   capabilities in the inventory, and where the checkpoint lives. Tell the user to review the
-   capability inventory (in the checkpoint) and then run **`/portkit-discover`** to continue.
+   features in the inventory, and where the checkpoint lives. Tell the user to review the
+   feature inventory (in the checkpoint) and then run **`/portkit-discover`** to continue.
    Do NOT auto-continue — the pause is the review point.

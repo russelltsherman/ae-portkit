@@ -1,5 +1,5 @@
 ---
-description: Analyze this codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs, acceptance criteria) a weaker model can rebuild from.
+description: Analyze this codebase into a stack-neutral recreation kit (PRD, architecture spec, per-slice specs, ADRs, acceptance criteria) a weaker model can rebuild from.
 argument-hint: [input-dir] [--input <dir>] [--output <dir>] [--fresh]
 allowed-tools: Bash, Workflow
 ---
@@ -8,7 +8,7 @@ allowed-tools: Bash, Workflow
 
 Run the **PortKit** workflow: a team of specialist agents deeply analyzes a codebase and emits a
 family of standard planning/design documents — a **PRD**, an **architecture/technical spec**,
-one **feature spec** per capability, **ADRs** for the significant decisions, and **acceptance
+one **slice spec** per feature, **ADRs** for the significant decisions, and **acceptance
 criteria** — detailed enough that a *less capable local model* can recreate the software **from the
 docs alone**. The output is **stack-neutral**: it describes the software to rebuild, not a port to a
 specific target language.
@@ -39,10 +39,10 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      `<inputDir>_portkit`.
    - `fresh: true` (from `--fresh`): ignore any existing checkpoint at the output dir and reprocess
      from scratch (see **Resuming** below). Omit it for the normal auto-resume behavior.
-   - Optional tuning knobs the user may pass through (only if they ask): `maxEpics`, `maxAdrs`
+   - Optional tuning knobs the user may pass through (only if they ask): `maxFeatures`, `maxAdrs`
      (cap on discovered ADRs; defaults to `12`), `maxGapfillRounds`, `maxConcurrency` (max agents in
      flight at once; defaults to `8` — lower it if the run is being API-rate-limited/throttled, raise
-     it to go faster on an account with generous limits), `checkpointEvery` (capabilities analyzed
+     it to go faster on an account with generous limits), `checkpointEvery` (features analyzed
      per discovery checkpoint; defaults to `maxConcurrency` — lower it to checkpoint more often on a
      flaky connection), and `maxAgents` (the per-run agent ceiling used for the over-scale guard;
      defaults to `1000` — the runtime's hard cap).
@@ -61,12 +61,12 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      them while keeping `[INFERRED]`/`[UNVERIFIED]` flags and real artifact paths. Point the rebuilder
      at `distilled/`, keep the top level for review. Reported via `counts.distilledDocs` /
      `counts.residualCitations` and `keyDocs.distilledDir`.
-   - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N feature specs
+   - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N slice specs
      (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
      adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —
      reported loudly (`counts.testLimited`, `counts.slicesOmittedForTest`, and a `🧪 TEST LIMIT`
      truncation) and **never a complete recreation kit**. For the cheapest end-to-end smoke test,
-     pair it with a low `maxEpics` to also cut discovery cost, e.g. `{ maxEpics: 2, limitSlices: 3 }`.
+     pair it with a low `maxFeatures` to also cut discovery cost, e.g. `{ maxFeatures: 2, limitSlices: 3 }`.
 
 3. **Invoke the workflow** with the `Workflow` tool, pointing `scriptPath` at the bundled script and
    passing the args object:
@@ -80,13 +80,13 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
 
 4. **When it completes**, check `resumeRequired` first:
    - If `resumeRequired` is `true`, the codebase was large enough that the workflow partitioned
-     feature-spec writing into resumable passes (nothing is dropped). It returns `resumeArgs` (e.g.
+     slice-spec writing into resumable passes (nothing is dropped). It returns `resumeArgs` (e.g.
      `{ resume: true, outputDir: "<dir>" }`). **Re-invoke the workflow with those args** (or just
      re-run the same command — it auto-resumes; see **Resuming**), and keep re-invoking until
-     `resumeRequired` is `false`. Each pass writes the next batch of feature specs against the same
+     `resumeRequired` is `false`. Each pass writes the next batch of slice specs against the same
      `outputDir`. Report progress (`slicesWritten` / `slicesRemaining`) between passes.
    - When `resumeRequired` is `false`, report the final summary: where the docs were written
-     (`outDir`), the feature/ADR counts, any **truncations** (real coverage gaps — surface them),
+     (`outDir`), the slice/ADR counts, any **truncations** (real coverage gaps — surface them),
      and the **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human
      must resolve.
    - If `stoppedForBudget` is `true`, the run **voluntarily paused** because it reached its token
@@ -99,9 +99,9 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
 ## Resuming
 
 PortKit checkpoints its progress to `<output>/.portkit/ir.json` after every stage — map, each
-discovery batch, synthesis, the doc family, ADRs, and each feature-spec write pass. If a run is
+discovery batch, synthesis, the doc family, ADRs, and each slice-spec write pass. If a run is
 interrupted anywhere, **re-running the same command auto-resumes** from the last completed stage
-instead of reprocessing: the expensive per-capability discovery, in particular, is preserved batch
+instead of reprocessing: the expensive per-feature discovery, in particular, is preserved batch
 by batch. The checkpoint is fingerprinted by the input dir, so a checkpoint for a different source is
 ignored (never a wrong-codebase resume), and it is deleted automatically when the run completes.
 
@@ -114,17 +114,17 @@ ignored (never a wrong-codebase resume), and it is deleted automatically when th
   half-old/half-new "Frankenstein" kit). Orphaned specs from a *larger* prior run may remain — use a
   clean or new `--output` dir if that matters.
 - **Scope guard:** auto-resume **refuses** and errors if the checkpoint was built with different
-  `maxEpics`/`limitSlices` than the current run (e.g. resuming a `limitSlices` smoke test with a
+  `maxFeatures`/`limitSlices` than the current run (e.g. resuming a `limitSlices` smoke test with a
   full-run command), rather than silently continuing the smaller scope. Use `--fresh` (clean dir)
   for a full run, or match the original knobs to continue.
 - `resume: true` — demand a checkpoint and continue it; errors if none exists (auto-resume is the
   normal path, so you rarely need this explicitly).
-- `checkpointEvery` — capabilities analyzed per discovery checkpoint (default `maxConcurrency`).
+- `checkpointEvery` — features analyzed per discovery checkpoint (default `maxConcurrency`).
 
 ## Notes
 
 - Output lands in the sibling dir `<input-dir>_portkit/` by default, never inside the input dir.
-  The kit is **stack-neutral** — a PRD, an architecture spec, per-feature specs, MADR-style ADRs,
+  The kit is **stack-neutral** — a PRD, an architecture spec, per-slice specs, MADR-style ADRs,
   and an acceptance-criteria rollup — so it describes what to rebuild without prescribing a target
   language.
 - **Grounding vs. inference:** observed facts cite `path:line`; reverse-engineered *intent* (PRD

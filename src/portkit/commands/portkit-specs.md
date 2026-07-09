@@ -1,5 +1,5 @@
 ---
-description: PortKit phase 5 — write one self-contained, self-testing feature spec per slice, then stop.
+description: PortKit phase 5 — write one self-contained, self-testing slice spec per slice, then stop.
 argument-hint: [input-dir] [--input <dir>] [--output <dir>]
 allowed-tools: Bash, Workflow
 ---
@@ -7,7 +7,7 @@ allowed-tools: Bash, Workflow
 # /portkit-specs
 
 Run the PortKit pipeline **up to and including the Write-specs phase**, then **pause** before the
-critic. One writer per slice emits a self-contained feature spec to `<output>/specs/<NNNN>-<slug>.md`,
+critic. One writer per slice emits a self-contained slice spec to `<output>/specs/<NNNN>-<slug>.md`,
 reading its component thread + acceptance criteria back from the side-cars.
 
 This phase can span several invocations on a large repo (over-scale partitioning or a token budget
@@ -38,5 +38,5 @@ resolve the SAME output dir as the earlier phases.
    - `resumeRequired: true` (with or without `stoppedForBudget`) — the write phase partitioned into
      passes. Re-run `/portkit-specs` (or `/loop` it), reporting `slicesWritten` / `slicesRemaining`
      between passes, until it pauses.
-   - `paused: true` — every feature spec is written. Report the spec count and location, then tell the
+   - `paused: true` — every slice spec is written. Report the spec count and location, then tell the
      user to review `specs/*.md` and run **`/portkit-critic`** to continue.

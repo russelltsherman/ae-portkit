@@ -13,14 +13,14 @@ These check the plugin is well-formed and the workflow is loadable. All currentl
 
 # unit + integration tests + a full-file syntax gate. Covers three layers:
 #  - portkit.deterministic.test.mjs — unit-tests the pure helpers in the
-#    <portkit:deterministic> region (topoSort, rewriteEdges, buildEpicTree,
-#    projectAgents, planEpicBatches, parseArgs), extracted from the file so the
+#    <portkit:deterministic> region (topoSort, rewriteEdges, buildFeatureTree,
+#    projectAgents, planFeatureBatches, parseArgs), extracted from the file so the
 #    shipped code IS the tested code; plus a full-file async-wrap parse gate.
 #  - portkit.run.test.mjs — RUNS the whole workflow body with a mock runtime
-#    (stub agent()/log()/phase()), validating the normal path, feature merging, the
+#    (stub agent()/log()/phase()), validating the normal path, slice merging, the
 #    doc-family + ADR fan-out, staged checkpoint/auto-resume (resume from map,
 #    partial discovery, or synthesized; source-fingerprint mismatch; --fresh), and
-#    the over-scale partition + resume passes (no feature dropped) — no model calls.
+#    the over-scale partition + resume passes (no slice dropped) — no model calls.
 # NOTE: plain `node --check` CANNOT validate the workflow — its body has top-level
 # `return`/`await`, legal only because the runtime wraps it in an async function;
 # the parse gate mimics that wrap.
@@ -53,7 +53,7 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
    a `CLAUDE_CODE_WORKFLOWS` shell env var (that variable is not used).
 2. A small **source fixture with good test coverage** — one language, modest size. **No fixture
    ships in this repo yet** (`src/examples/` does not exist); Tier 2 is blocked until one is added.
-   The intended fixture is a tested Go HTTP JSON service (~4 vertical capabilities, `go test ./...`
+   The intended fixture is a tested Go HTTP JSON service (~4 vertical features, `go test ./...`
    passing at high coverage).
 
 ### Run
@@ -67,19 +67,19 @@ entry, command frontmatter/`Workflow` wiring, workflow presence, and auto-discov
 | # | Gate | How to check |
 |---|---|---|
 | 1 | Full doc set produced | `PRD.md`, `ARCHITECTURE.md`, `INDEX.md`, `ACCEPTANCE.md`, `RISKS-AND-GAPS.md`, ≥1 `specs/NNNN-*.md` all exist under the fixture's `_portkit/` dir |
-| 2 | Grounding | Sample `path:line` citations in ARCHITECTURE.md and the feature specs; each resolves to real source |
-| 3 | Feature-spec integrity | `INDEX.md` order is topological; pick 3 feature specs — each is end-to-end, self-contained, has acceptance criteria, references only ARCHITECTURE.md (no dangling cross-feature refs) |
+| 2 | Grounding | Sample `path:line` citations in ARCHITECTURE.md and the slice specs; each resolves to real source |
+| 3 | Slice-spec integrity | `INDEX.md` order is topological; pick 3 slice specs — each is end-to-end, self-contained, has acceptance criteria, references only ARCHITECTURE.md (no dangling cross-slice refs) |
 | 4 | Acceptance spec | `ACCEPTANCE.md` criteria trace back to actual fixture tests; thin areas are flagged |
 | 5 | Truncations surfaced | The workflow result's `truncations` array and `RISKS-AND-GAPS.md` name anything capped (no silent drops) |
 | 6 | ADRs present + evidenced | ≥1 `adr/NNNN-*.md`, each in MADR form with status `Reconstructed`, a `path:line`-evidenced decision, and rationale/"why" tagged `[INFERRED]` |
 | 7 | Inference tagged, not asserted | PRD goals/non-goals/success-metrics and ADR rationale carry `[INFERRED]`; functional requirements cite `path:line`. No inference is presented as observed fact |
-| 8 | Resumability | Interrupt a run mid-discovery (Ctrl-C / kill), confirm `<output>/.portkit/ir.json` exists with a `stage`, then re-run the SAME command: it logs `↩️ Resuming from checkpoint stage '…'`, does NOT re-run `map:survey` or already-analyzed `discover:*` capabilities, and finishes. On clean completion the checkpoint file is gone. `--fresh` forces a full reprocess |
-| 9 | Token-budget chunking | Run with a small `maxTokensPerRun` (or a `+Nk` directive). The run returns `stoppedForBudget: true` + `resumeRequired: true`, having advanced past `mapped`, and `.portkit/ir.json` reflects the paused `stage`. Repeated resumes (or `/loop`) complete the kit with **every** feature spec written exactly once and no dangling `INDEX.md` links; the checkpoint is cleared on final completion. With **no** budget set, a normal run finishes in one pass (byte-identical) |
-| 10 | Scope/fresh safety | Resuming a checkpoint built with different `maxEpics`/`limitSlices` aborts loudly (does not silently continue the smaller scope). A `--fresh` run over an existing kit clears `.portkit` and overwrites the prior docs (no stale 5-epic `INDEX.md` left behind) |
+| 8 | Resumability | Interrupt a run mid-discovery (Ctrl-C / kill), confirm `<output>/.portkit/ir.json` exists with a `stage`, then re-run the SAME command: it logs `↩️ Resuming from checkpoint stage '…'`, does NOT re-run `map:survey` or already-analyzed `discover:*` features, and finishes. On clean completion the checkpoint file is gone. `--fresh` forces a full reprocess |
+| 9 | Token-budget chunking | Run with a small `maxTokensPerRun` (or a `+Nk` directive). The run returns `stoppedForBudget: true` + `resumeRequired: true`, having advanced past `mapped`, and `.portkit/ir.json` reflects the paused `stage`. Repeated resumes (or `/loop`) complete the kit with **every** slice spec written exactly once and no dangling `INDEX.md` links; the checkpoint is cleared on final completion. With **no** budget set, a normal run finishes in one pass (byte-identical) |
+| 10 | Scope/fresh safety | Resuming a checkpoint built with different `maxFeatures`/`limitSlices` aborts loudly (does not silently continue the smaller scope). A `--fresh` run over an existing kit clears `.portkit` and overwrites the prior docs (no stale 5-feature `INDEX.md` left behind) |
 
 ### Gate 11 — the core bet (stretch, the only test that truly validates the premise)
 
-Hand a handful of ordered feature specs (+ ARCHITECTURE.md) to an **actual weak local model**
+Hand a handful of ordered slice specs (+ ARCHITECTURE.md) to an **actual weak local model**
 (ollama/omlx) and confirm it can produce passing units **from the docs alone**, without the source.
 If it can't, the IR — not the orchestration — is what needs work.
 

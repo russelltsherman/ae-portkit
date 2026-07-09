@@ -1,14 +1,14 @@
 export const meta = {
   name: 'portkit',
-  description: 'Analyze a codebase into a stack-neutral recreation kit (PRD, architecture spec, per-feature specs, ADRs, acceptance criteria) a weaker model can rebuild from',
+  description: 'Analyze a codebase into a stack-neutral recreation kit (PRD, architecture spec, per-slice specs, ADRs, acceptance criteria) a weaker model can rebuild from',
   whenToUse: 'Reverse-engineering an existing project into design/planning docs, for a weaker downstream model to recreate it from the docs alone',
   phases: [
     { title: 'Preflight', detail: 'verify the input dir exists; abort loudly if not' },
-    { title: 'Map', detail: 'survey the repo; draft the capability inventory' },
-    { title: 'Discover slices', detail: 'trace each capability end-to-end; extract behavioral spec from tests' },
-    { title: 'Synthesize', detail: 'normalize/dedup features; compute the build order; author PRD + ARCHITECTURE + INDEX + ACCEPTANCE' },
+    { title: 'Map', detail: 'survey the repo; draft the feature inventory' },
+    { title: 'Discover slices', detail: 'trace each feature end-to-end; extract behavioral spec from tests' },
+    { title: 'Synthesize', detail: 'normalize/dedup slices; compute the build order; author PRD + ARCHITECTURE + INDEX + ACCEPTANCE' },
     { title: 'ADRs', detail: 'discover architecturally significant decisions; write one MADR-style ADR each' },
-    { title: 'Write specs', detail: 'one self-contained, self-testing feature spec per unit' },
+    { title: 'Write specs', detail: 'one self-contained, self-testing slice spec per unit' },
     { title: 'Critic', detail: 'grounding + completeness pass; write RISKS-AND-GAPS.md' },
     { title: 'Distill', detail: 'opt-in: emit a citation-free distilled/ mirror for the weaker rebuilder' },
   ],
@@ -47,27 +47,31 @@ const OUT = (() => {
 
 // ---------------------------------------------------------------------------
 // Scale guards. The Workflow runtime caps a run at ~1000 agents total and 4096
-// items per parallel/pipeline call. A large repo with per-epic + per-feature +
+// items per parallel/pipeline call. A large repo with per-feature + per-slice +
 // per-ADR fan-out can blow that, so we cap each axis and LOG anything we drop
 // (silent truncation reads as "complete" when it isn't). Overridable via args.
 //
-// NOTE: there is deliberately NO cap on total features/slices. They ARE the
+// NOTE: there is deliberately NO cap on total slices/slices. They ARE the
 // deliverable — dropping them produces an incomplete recreation kit, which defeats
-// the plugin. Genuine over-scale (feature fan-out that would approach the
-// ~1000-agent ceiling) is handled by epic-partitioned resumable passes, not by
-// discarding features.
+// the plugin. Genuine over-scale (slice fan-out that would approach the
+// ~1000-agent ceiling) is handled by feature-partitioned resumable passes, not by
+// discarding slices.
 // ---------------------------------------------------------------------------
-const MAX_EPICS = Number(cfg.maxEpics) || 40
+// `maxFeatures` caps the coarse capability inventory (was `maxEpics`). The legacy name is
+// still accepted as an alias — via the parseCliArgs alias table for the CLI-string form, and
+// here for the structured-object form — so existing `{ maxEpics: N }` / `--maxEpics N` calls
+// keep working after the epic→feature rename.
+const MAX_FEATURES = Number(cfg.maxFeatures ?? cfg.maxEpics) || 40
 // Architecturally significant decisions get one MADR-style ADR each. Bounded (the
 // consumer needs the load-bearing decisions, not an exhaustive archaeology).
 const MAX_ADRS = Number(cfg.maxAdrs) || 12
 const MAX_GAPFILL_ROUNDS = Number(cfg.maxGapfillRounds) || 2
-// DEV/TEST ONLY cost cap. `limitSlices=N` writes only the first N features (in build
+// DEV/TEST ONLY cost cap. `limitSlices=N` writes only the first N slices (in build
 // order) so a live run exercises the ENTIRE pipeline (map → discover → synthesize →
 // adrs → write → critic) cheaply. 0 = unlimited = the production default. This is
 // deliberately NOT the removed silent `maxSlices` cap: it is opt-in, off by default,
 // and reported LOUDLY as a partial/test kit — never presented as a complete
-// recreation kit. Pair with a low `maxEpics` to also cut discovery cost for a smoke test.
+// recreation kit. Pair with a low `maxFeatures` to also cut discovery cost for a smoke test.
 const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 
 // FRESH run: ignore any checkpoint AND regenerate the kit from scratch. The doc/spec/ADR writers
@@ -102,14 +106,14 @@ const rewriteClause = (path) => FRESH
 const MAX_CONCURRENCY = Math.max(1, Number(cfg.maxConcurrency) || 8)
 
 // Checkpoint granularity for the discovery phase. Discovery is the most expensive
-// analysis phase (2 agents per capability), so we process capabilities in batches
+// analysis phase (2 agents per feature), so we process features in batches
 // of this size and persist a checkpoint after each batch — an interruption keeps
-// every already-analyzed capability instead of reprocessing discovery from scratch.
+// every already-analyzed feature instead of reprocessing discovery from scratch.
 const CHECKPOINT_EVERY = Math.max(1, Number(cfg.checkpointEvery) || MAX_CONCURRENCY)
 
 // Over-scale guard. Slices are NEVER dropped. When a single run's projected agent
 // count would approach the runtime's ~1000-agent ceiling, the expensive write
-// phase is partitioned into epic-batched RESUMABLE passes: the synthesized IR is
+// phase is partitioned into feature-batched RESUMABLE passes: the synthesized IR is
 // persisted under OUT and reloaded on `{ resume: true }`, so the costly map/
 // discover/synthesize work runs exactly once and only slice-writing fans out
 // across passes. Both knobs are tunable (tests force partitioning with a low cap).
@@ -129,10 +133,10 @@ const MAX_TOKENS_PER_RUN = Math.max(0, Number(cfg.maxTokensPerRun) || 0)
 const TOKEN_RESERVE = (cfg.tokenReserve == null) ? 50_000 : Math.max(0, Number(cfg.tokenReserve) || 0)
 const IR_PATH = `${OUT}/.portkit/ir.json`
 // The checkpoint (ir.json) holds ONLY small, low-entropy state — stage, source,
-// capability summaries, and LIGHT per-slice metadata (id/name/deps/one-line summary).
+// feature summaries, and LIGHT per-slice metadata (id/name/deps/one-line summary).
 // The bulky, high-entropy analysis (each slice's component thread + extracted
 // behavioral acceptance criteria) is NOT in the checkpoint: the discovery agents that
-// GENERATE it write it to per-capability side-car files under EPICS_DIR, and the
+// GENERATE it write it to per-feature side-car files under FEATURES_DIR, and the
 // write/ACCEPTANCE agents read it back from there. This is deliberate: a model turn
 // stalls when forced to REPRODUCE a large exact blob (measured: a ~4KB checkpoint
 // persists fine, a ~200KB one hangs the request), but GENERATING content to a file
@@ -141,10 +145,10 @@ const IR_PATH = `${OUT}/.portkit/ir.json`
 // reproduction path entirely.
 const IR_OPEN = '<<<PORTKIT-IR-JSON>>>'
 const IR_CLOSE = '<<<END-PORTKIT-IR-JSON>>>'
-// Per-capability side-car files (heavy analysis), written by the discovery agents
+// Per-feature side-car files (heavy analysis), written by the discovery agents
 // that generate them and read by the write/ACCEPTANCE agents. Survive across a
 // resume (only clearIR, on success, removes them).
-const EPICS_DIR = `${OUT}/.portkit/epics`
+const FEATURES_DIR = `${OUT}/.portkit/features`
 
 const dropped = [] // truncation ledger, surfaced in the final result + RISKS doc
 function cap(list, max, what) {
@@ -165,27 +169,43 @@ function cap(list, max, what) {
 // this fence too. Anything that touches an agent or writes a file does NOT belong here.
 //
 // VOCABULARY: this region is a build-GRAPH engine and keeps the internal IR names
-// `slice`/`epic`/`dependsOn`. The OUTPUT layer maps them to user-facing terms:
-// a `slice` becomes a per-FEATURE spec (specs/<n>-<name>.md) and an `epic` is a
-// CAPABILITY grouping in INDEX.md. Renaming here would churn every tested helper
+// `slice`/`feature`/`dependsOn`. The OUTPUT layer maps them to user-facing terms:
+// a `slice` becomes a per-SLICE spec (specs/<n>-<name>.md) and an `feature` is a
+// FEATURE grouping in INDEX.md. Renaming here would churn every tested helper
 // for zero behavioral gain, so the mismatch is intentional and documented once.
 
 // slug — filesystem-safe kebab-case, TRUNCATED to 48 chars. pad — zero-pad a build
 // number to 4 digits. These live INSIDE the fence because specName() below depends on
-// them and specName is the single source of truth for a feature spec's filename.
+// them and specName is the single source of truth for a slice spec's filename.
 function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'slice'
 }
 function pad(n) { return String(n).padStart(4, '0') }
 
-// specName — the EXACT basename of a feature spec file: `<NNNN>-<slug>.md`. This is
-// the SINGLE SOURCE OF TRUTH for the filename. Both sliceDocPath() (which WRITES the
-// file) and the INDEX writer's link target derive from it, so an INDEX link can never
-// disagree with the file on disk. The 48-char cap in slug() truncates the name part,
-// so a long feature name yields e.g. `0001-...-config-constan.md` — the link MUST use
-// this same truncated basename, never a re-slugified full name (that was the dangling-
-// link bug: the INDEX agent recomputed a slug without the cap).
-function specName(n, name) { return `${pad(n)}-${slug(name)}.md` }
+// Canonical DISPLAY identifiers — the user-facing ids shown in every kit document. They are
+// DETERMINISTIC functions of the JS-owned ordering (a slice's build number n; a feature's
+// first-appearance index; an ADR's significance rank), NOT the free-form ids the discovery
+// agents emit. The raw agent id stays the internal graph/checkpoint KEY (feature key / slice
+// key); these are the labels a reader sees, so specs/INDEX/ADRs never disagree on how a unit
+// is named. Kept in the fence beside the filename SoTs and unit-tested identically.
+//   sliceId    — SL-<NNNN>   from build order (the primary per-spec identifier)
+//   featureId  — FEAT-<NN>   from the feature's first-appearance order in the map (2-digit; FEAT-100+ if >99)
+//   adrId      — ADR-<NNNN>  from the decision's significance rank
+function sliceId(n) { return `SL-${pad(n)}` }
+function featureId(n) { return `FEAT-${String(n).padStart(2, '0')}` }
+function adrId(n) { return `ADR-${pad(n)}` }
+
+// specName / adrName — the EXACT basename of a slice spec / ADR file, `<ID>-<slug>.md`
+// (e.g. `SL-0001-init-dispatch.md`, `ADR-0005-write-acl-matrix.md`). These are the SINGLE
+// SOURCE OF TRUTH for their filenames: the writer (which WRITES the file), the INDEX link
+// target, and the distiller ALL derive from them, so a link can never disagree with the file
+// on disk. `label` is the unit's TERSE HANDLE — a short kebab descriptor the discovery/ADR
+// agents emit alongside the full name/title (which stays the document's H1). slug() lower-cases,
+// kebabs, and 48-char-caps it; callers pass `handle || name` so a missing handle degrades to
+// the old behavior instead of breaking. The `SL-`/`ADR-` prefix (from sliceId/adrId) makes the
+// filename unique regardless of handle collisions, and self-identifying at a glance.
+function specName(n, label) { return `${sliceId(n)}-${slug(label)}.md` }
+function adrName(n, label) { return `${adrId(n)}-${slug(label)}.md` }
 
 // parseArgs — normalize the workflow's `args` input into a plain config object,
 // no matter how it arrives. The slash command is SUPPOSED to hand us a structured
@@ -216,11 +236,12 @@ function parseArgs(raw) {
 // --flag=value form) override the positional input dir, as the command spec states.
 // Recognized flag aliases collapse to the canonical cfg keys (inputDir/outputDir);
 // any other --flag passes through with its name preserved (camelCase intact) so
-// tuning knobs like --maxEpics still work. A bare --flag with no value becomes `true`.
+// tuning knobs like --maxFeatures still work. A bare --flag with no value becomes `true`.
 function parseCliArgs(s) {
   const alias = {
     input: 'inputDir', inputdir: 'inputDir',
     output: 'outputDir', outputdir: 'outputDir', out: 'outputDir', outdir: 'outputDir',
+    maxepics: 'maxFeatures', // legacy alias: --maxEpics still caps the feature inventory
   }
   const toks = s.split(/\s+/).filter(Boolean)
   const cfg = {}
@@ -345,57 +366,57 @@ function rewriteEdges(slices, mergeMap) {
   return { slices: out, notes }
 }
 
-// buildEpicTree — group slices into an epic->slices tree, preserving first-
-// appearance order of both epics and slices (deterministic). Returns
-// [{ epicId, sliceIds: [id…] }…]. Slices with no epicId are grouped under null.
-function buildEpicTree(slices) {
-  const tree = new Map() // epicId -> [sliceId…]
+// buildFeatureTree — group slices into an feature->slices tree, preserving first-
+// appearance order of both features and slices (deterministic). Returns
+// [{ featureKey, sliceIds: [id…] }…]. Slices with no featureKey are grouped under null.
+function buildFeatureTree(slices) {
+  const tree = new Map() // featureKey -> [sliceKey…]
   for (const s of slices) {
-    const e = s.epicId ?? null
+    const e = s.featureKey ?? null
     if (!tree.has(e)) tree.set(e, [])
     tree.get(e).push(s.id)
   }
-  return Array.from(tree, ([epicId, sliceIds]) => ({ epicId, sliceIds }))
+  return Array.from(tree, ([featureKey, sliceIds]) => ({ featureKey, sliceIds }))
 }
 
 // projectAgents — estimate the total agent() calls a single full run would make,
 // to decide whether to partition the write phase (the runtime caps a run at ~1000
-// agents). Mirrors the actual fan-out: preflight + map + 2/epic (discover+behavior)
-// + synthesize + index + acceptance + architecture + prd + adr:discover + 1/feature
+// agents). Mirrors the actual fan-out: preflight + map + 2/feature (discover+behavior)
+// + synthesize + index + acceptance + architecture + prd + adr:discover + 1/slice
 // (write) + min(adrCount, maxAdrs) (adr writers) + critic (1 + gapfill rounds).
 // Deliberately an upper-ish estimate; the per-gap fixers are unpredictable so they
 // are folded into the gapfill term. The checkpoint agents (one loadIR at startup +
 // a persist per stage/discovery-batch + one clearIR at the end) are deliberately NOT
 // modeled here: they are a small constant the SAFE_BUDGET safety factor absorbs, and
 // counting them would only make the over-scale guard trip slightly earlier.
-function projectAgents({ epicCount = 0, sliceCount = 0, adrCount = 0, maxAdrs = 0, gapfillRounds = 0 } = {}) {
+function projectAgents({ featureCount = 0, sliceCount = 0, adrCount = 0, maxAdrs = 0, gapfillRounds = 0 } = {}) {
   // preflight, map, synthesize, index, acceptance, architecture, prd, adr:discover, critic(base)
   const fixed = 9
-  const discovery = 2 * epicCount
+  const discovery = 2 * featureCount
   const writes = sliceCount
   const adrs = Math.min(adrCount, maxAdrs)
   return fixed + discovery + writes + adrs + gapfillRounds
 }
 
-// planEpicBatches — partition epics into ordered write batches so each batch's
-// total slice count stays within `perBatch`, WITHOUT splitting an epic across
-// batches (partition-by-epic). A single epic larger than `perBatch` becomes its
+// planFeatureBatches — partition features into ordered write batches so each batch's
+// total slice count stays within `perBatch`, WITHOUT splitting an feature across
+// batches (partition-by-feature). A single feature larger than `perBatch` becomes its
 // own batch (we never split or drop slices — an over-budget batch is acceptable;
-// a dropped slice is not). Returns [{ epicIds:[…], sliceIds:[…] }…]; an epicId of
-// null is preserved as-is. With a non-positive limit, every epic is its own batch.
+// a dropped slice is not). Returns [{ featureKeys:[…], sliceIds:[…] }…]; an featureKey of
+// null is preserved as-is. With a non-positive limit, every feature is its own batch.
 // (Param is `perBatch`, not `budget` — `budget` is a reserved runtime global.)
-function planEpicBatches(epicTree, perBatch) {
+function planFeatureBatches(featureTree, perBatch) {
   const limit = perBatch > 0 ? perBatch : 1
   const batches = []
   let cur = null
-  for (const { epicId, sliceIds } of epicTree) {
+  for (const { featureKey, sliceIds } of featureTree) {
     const size = sliceIds.length
-    if (!cur) { cur = { epicIds: [epicId], sliceIds: [...sliceIds] }; continue }
+    if (!cur) { cur = { featureKeys: [featureKey], sliceIds: [...sliceIds] }; continue }
     if (cur.sliceIds.length + size > limit && cur.sliceIds.length > 0) {
       batches.push(cur)
-      cur = { epicIds: [epicId], sliceIds: [...sliceIds] }
+      cur = { featureKeys: [featureKey], sliceIds: [...sliceIds] }
     } else {
-      cur.epicIds.push(epicId)
+      cur.featureKeys.push(featureKey)
       cur.sliceIds.push(...sliceIds)
     }
   }
@@ -406,7 +427,7 @@ function planEpicBatches(epicTree, perBatch) {
 // STAGES — the linear checkpoint ladder the workflow advances through, persisted in
 // the IR as `stage`. A resume skips every stage whose work is already done. The
 // intermediate 'discovering' marks a PARTIALLY complete discovery phase (some
-// capabilities analyzed, more to go), so it sits between 'mapped' and 'discovered'.
+// features analyzed, more to go), so it sits between 'mapped' and 'discovered'.
 // 'critiqued' and 'distilled' are the terminal stages (Critic + the opt-in Distill
 // mirror), promoted to first-class ladder stages so the per-phase commands can stop
 // after each. stageList() is the single source of truth for the order; stageIndex()
@@ -447,7 +468,7 @@ function stageAfter(stage) {
 }
 
 // chunk — split an array into fixed-size, order-preserving groups (used to batch
-// capability discovery so each batch can checkpoint). A non-positive size yields a
+// feature discovery so each batch can checkpoint). A non-positive size yields a
 // single group (or none for an empty input).
 function chunk(arr, size) {
   if (!(size > 0)) return arr.length ? [arr.slice()] : []
@@ -485,27 +506,27 @@ function findSourceCitations(text) {
   return String(text).match(re) || []
 }
 
-// planResume — PURE. Decide, from the per-capability side-car scan, what each capability
+// planResume — PURE. Decide, from the per-feature side-car scan, what each feature
 // needs on RESUME. The analyzed source is STATIC, so its slice decomposition is a FIXED
-// target: a capability's slice STRUCTURE (light.json) is a deterministic function of the
+// target: a feature's slice STRUCTURE (light.json) is a deterministic function of the
 // source and, once written, DURABLE — it must be RELOADED, never re-discovered. Re-running
 // discovery would produce a different slice set and RENUMBER every downstream spec, turning
 // a resume into a duplicate rewrite (the exact bug this guards against). behavior.json is a
 // DOWNSTREAM artifact (test-derived acceptance criteria); when it ALONE is missing we re-run
 // ONLY the behavior agent against the reloaded slices — structure and numbering untouched.
-// Returns { reload, behaviorOnly, discover } as epic-id arrays in `epics` order:
+// Returns { reload, behaviorOnly, discover } as feature-id arrays in `features` order:
 //   - reload:       has light.json                  -> reload slices (structure is fixed)
 //   - behaviorOnly: reload ∩ missing behavior.json  -> behavior re-run only (no re-discovery)
 //   - discover:     no light.json                   -> full discovery (never analyzed yet)
-function planResume(epics, scan) {
-  // Side-car filenames are slug-lowercased (slicesCarPath -> slug(epicId)), so the resume-scan
-  // agent reports lowercase ids ("cap-init") while checkpoint epic ids are uppercase ("CAP-INIT").
+function planResume(features, scan) {
+  // Side-car filenames are slug-lowercased (slicesCarPath -> slug(featureKey)), so the resume-scan
+  // agent reports lowercase ids ("cap-init") while checkpoint feature ids are uppercase ("CAP-INIT").
   // Match case-insensitively so resume actually reloads durable side-cars instead of dropping every
-  // capability into re-discovery (which, past the 'discovered' stage, yieldszero slices).
+  // feature into re-discovery (which, past the 'discovered' stage, yieldszero slices).
   const norm = x => String(x || '').toLowerCase()
   const byId = new Map((scan || []).map(e => [e && norm(e.id), e]))
   const reload = [], behaviorOnly = [], discover = []
-  for (const e of (epics || [])) {
+  for (const e of (features || [])) {
     const s = byId.get(norm(e.id))
     if (s && s.hasLight) {
       reload.push(e.id)
@@ -518,27 +539,27 @@ function planResume(epics, scan) {
 }
 
 // omissionScopeNote — PURE. A DEV/TEST run can intentionally omit work: `limitSlices` writes only
-// the first N feature specs (in build order), and `maxEpics` analyzes only the first M capabilities.
+// the first N slice specs (in build order), and `maxFeatures` analyzes only the first M features.
 // Those omissions are BY DESIGN and are reported LOUDLY as a PARTIAL test kit — they are NOT defects.
 // This builds the scope caveat prepended to the critic + gap-fix prompts so the gap-fill loop never
 // "repairs" a deliberate truncation by regenerating the omitted specs (or reverse-engineering a
-// dropped capability straight from source) — which would silently convert a partial test kit into a
+// dropped feature straight from source) — which would silently convert a partial test kit into a
 // claimed-complete one, contradicting the run's own testLimited/slicesOmittedForTest report. Returns
 // '' when NOTHING was intentionally omitted, so a full/unlimited run's prompts stay byte-identical.
-function omissionScopeNote({ slicesOmittedForTest = 0, limitSlices = 0, epicsKept = 0, epicsTotal = 0 } = {}) {
+function omissionScopeNote({ slicesOmittedForTest = 0, limitSlices = 0, featuresKept = 0, featuresTotal = 0 } = {}) {
   const parts = []
   if (slicesOmittedForTest > 0) {
-    parts.push(`${slicesOmittedForTest} feature spec(s) were INTENTIONALLY omitted (limitSlices=${limitSlices}: only the first ${limitSlices} feature(s) in build order were written)`)
+    parts.push(`${slicesOmittedForTest} slice spec(s) were INTENTIONALLY omitted (limitSlices=${limitSlices}: only the first ${limitSlices} slice(s) in build order were written)`)
   }
-  if (epicsTotal > epicsKept) {
-    parts.push(`${epicsTotal - epicsKept} capability(ies) were INTENTIONALLY dropped (maxEpics cap: only ${epicsKept} of ${epicsTotal} discovered capability(ies) were analyzed)`)
+  if (featuresTotal > featuresKept) {
+    parts.push(`${featuresTotal - featuresKept} feature(ies) were INTENTIONALLY dropped (maxFeatures cap: only ${featuresKept} of ${featuresTotal} discovered feature(ies) were analyzed)`)
   }
   if (parts.length === 0) return ''
   return `INTENTIONAL TEST-SCOPE LIMITS — READ THIS FIRST: this is a deliberately PARTIAL test kit, NOT a complete recreation kit. ` +
-    `${parts.join('; ')}. These omissions are BY DESIGN, not defects. Audit ONLY the features and capabilities actually present in the kit. ` +
-    `Do NOT report an intentionally-omitted feature or capability as a "missing piece" or gap, do NOT mark such a gap fixable, and do NOT ` +
-    `(and any fix agent MUST NOT) regenerate, back-fill, or reverse-engineer the omitted feature specs or capabilities. A dependsOn that ` +
-    `points at an intentionally-omitted feature is expected and MUST NOT be flagged. Editing INDEX/ACCEPTANCE to claim the full feature ` +
+    `${parts.join('; ')}. These omissions are BY DESIGN, not defects. Audit ONLY the slices and features actually present in the kit. ` +
+    `Do NOT report an intentionally-omitted slice or feature as a "missing piece" or gap, do NOT mark such a gap fixable, and do NOT ` +
+    `(and any fix agent MUST NOT) regenerate, back-fill, or reverse-engineer the omitted slice specs or features. A dependsOn that ` +
+    `points at an intentionally-omitted slice is expected and MUST NOT be flagged. Editing INDEX/ACCEPTANCE to claim the full slice ` +
     `set is present is FORBIDDEN — the partial scope must remain accurately reported.`
 }
 // </portkit:deterministic>
@@ -582,18 +603,152 @@ const INFER_RULE =
   'observable` when the source shows no evidence.'
 
 // ---------------------------------------------------------------------------
+// House style + document skeletons. These live OUTSIDE the <portkit:deterministic> fence: they
+// are prose constants, not pure data helpers, and a template that happened to contain a fenced-
+// banned token (e.g. "budget") would trip the purity gate. They are the SINGLE SOURCE OF TRUTH
+// for how every kit document is shaped, so the whole family reads as one seasoned author wrote it
+// (the user's ask: kill the per-writer variance in sections/formatting/ids). Each writer injects
+// HOUSE_STYLE + its skeleton and is told to fill the EXACT headings verbatim. Guarded by source-grep
+// tests (the consts live outside the fence, so loadDeterministic() can't see them).
+// ---------------------------------------------------------------------------
+const HOUSE_STYLE =
+  'HOUSE STYLE (mandatory — every kit document obeys this so the whole kit reads as one author):\n' +
+  '- Vocabulary: use ONLY "Feature", "Slice", and "ADR". A FEATURE is a coarse, externally-observable ' +
+  'area of the system; a SLICE is one fine, independently-buildable behavior thread within a feature. ' +
+  'NEVER write the words "epic", "capability", or "vertical thread" in output prose.\n' +
+  '- Identifiers: reference every unit by the canonical id you are GIVEN, VERBATIM — Slice `SL-NNNN`, ' +
+  'Feature `FEAT-NN`, ADR `ADR-NNNN`. Never invent, renumber, re-case, or reformat an id.\n' +
+  '- Structure: reproduce the section skeleton EXACTLY — every heading, at its given level, in the ' +
+  'given order. Do NOT add, rename, reorder, merge, or drop a heading. An empty section keeps its ' +
+  'heading with `None observed.` (or `[INFERRED] none observable` for an intent section).\n' +
+  '- Open with the metadata header block exactly as specified, fields in the given order.\n' +
+  '- Voice: a senior engineer writing a precise, prescriptive spec — neutral, exact, no filler, no ' +
+  'marketing, no emojis. One `#` H1; sections are `##`; ids, paths, and types in `backticks`.'
+
+// The per-SLICE spec — the load-bearing, fanned-out document. Exact headings; {…} are filled from data.
+const SLICE_SPEC_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# {sliceId}: {name}\n\n' +
+  '**Slice ID:** {sliceId}\n' +
+  '**Build #:** {n}\n' +
+  '**Feature:** {feature}\n' +
+  '**Status:** Reconstructed\n' +
+  '**Depends on:** {dependsOn — a list of Slice IDs, or "None"}\n\n' +
+  '## Summary\n' +
+  'One-line observable behavior this slice delivers.\n\n' +
+  '## Behavior Thread\n' +
+  'The end-to-end thread, each component with its source `path:line` (from the side-car), in execution order.\n\n' +
+  '## Interface & Contract\n' +
+  'Inputs, outputs, and EXACT behavior — every error, edge case, and ordering guarantee.\n\n' +
+  '## Acceptance Criteria\n' +
+  'The concrete, runnable-in-spirit checks from the behavior side-car; state coverage good/thin/none.\n\n' +
+  '## Build Steps\n' +
+  'Function/unit-sized steps, each individually checkable.\n\n' +
+  '## Shared Conventions\n' +
+  'Reference `ARCHITECTURE.md` for shared names/types/cross-cutting rules — do NOT restate them, and ' +
+  'do NOT depend on any other slice\'s internals.'
+
+const ARCHITECTURE_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# Architecture\n\n' +
+  '**Status:** Reconstructed\n\n' +
+  '## Tech Stack & Build/Test\n' +
+  'Languages, build system, test framework(s), where tests live, dependency manifests.\n\n' +
+  '## Component Inventory\n' +
+  'The internal building blocks and their responsibilities.\n\n' +
+  '## Data Model & Vocabulary\n' +
+  'Core types/entities and a naming glossary of shared names the slices rely on.\n\n' +
+  '## Data Flows\n' +
+  'For each feature (by `FEAT-NN`), how a request/event moves through the components.\n\n' +
+  '## Cross-Cutting Concerns\n' +
+  'Auth, config, logging, error handling, concurrency — stated as RULES the slices obey.'
+
+const PRD_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# Product Requirements\n\n' +
+  '**Status:** Reconstructed\n\n' +
+  '## Overview\n' +
+  'What the software does and the problem it appears to solve.\n\n' +
+  '## Goals\n`[INFERRED]` outcomes the software seems built to achieve.\n\n' +
+  '## Non-Goals\n`[INFERRED]` from what it deliberately does NOT do.\n\n' +
+  '## Success Metrics\n`[INFERRED]` — never fabricate numbers; `[INFERRED] none observable` if unclear.\n\n' +
+  '## Users & Personas\n`[INFERRED]` who the observable interfaces serve.\n\n' +
+  '## Functional Requirements\n' +
+  'One grounded bullet per feature (by `FEAT-NN`), each citing `path:line`.\n\n' +
+  '## Constraints & Assumptions\n' +
+  'Observed constraints and the assumptions this reconstruction rests on.'
+
+const ADR_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# {adrId}: {title}\n\n' +
+  '**ADR ID:** {adrId}\n' +
+  '**Status:** Reconstructed\n\n' +
+  '## Context & Problem\n' +
+  'The observed situation the decision addresses — cite `path:line`.\n\n' +
+  '## Decision Drivers\n' +
+  'The forces that shaped the decision.\n\n' +
+  '## Considered Options\n' +
+  'The chosen option (grounded) and plausible rejected alternatives (`[INFERRED]`).\n\n' +
+  '## Decision Outcome\n' +
+  'What the source actually does — cite the EVIDENCE.\n\n' +
+  '## Consequences\n' +
+  'The resulting trade-offs a rebuilder inherits.\n\n' +
+  '## Rationale\n`[INFERRED]` — the source rarely states why; do not present a guess as fact.'
+
+const INDEX_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# Recreation Index\n\n' +
+  '## Features & Slices\n' +
+  'A tree grouped by feature in the given order: each feature as `FEAT-NN <name>`, then its slices as ' +
+  '`SL-NNNN <name>` each linked to its exact `spec` path.\n\n' +
+  '## Recommended Build Order\n' +
+  'A numbered list (#1 first); each entry: `SL-NNNN`, name, its feature `FEAT-NN`, and its `Depends on` Slice IDs.\n\n' +
+  '## Merged Slices\n' +
+  'Any slice whose `mergedFrom` is non-empty (it absorbed duplicates); `None` if there were none.'
+
+const ACCEPTANCE_TEMPLATE =
+  'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
+  '# Acceptance Criteria\n\n' +
+  '## Coverage Summary\n' +
+  'A table `Slice (SL-NNNN) | Feature (FEAT-NN) | Coverage (good/thin/none)`, LOUDLY flagging every ' +
+  'thin/none slice as a rebuild risk.\n\n' +
+  '## Acceptance Criteria by Feature\n' +
+  'Grouped by feature (`FEAT-NN`); for each slice (`SL-NNNN`) its criteria with source test `path:line` refs.'
+
+const GLOSSARY_TEMPLATE =
+  'Write a GLOSSARY that defines, in a two-column Markdown table `| Term | Definition |`, EXACTLY these ' +
+  'terms in this order — copy the definitions faithfully (this is the kit\'s canonical vocabulary; do ' +
+  'not invent, drop, or reorder terms):\n\n' +
+  '# Glossary\n\n' +
+  '**Status:** Reconstructed\n\n' +
+  '| Term | Definition |\n|---|---|\n' +
+  '| **Feature** | A coarse, externally-observable area of the system (an endpoint group, CLI command, public API surface, event/job, or UI flow). The grouping level. |\n' +
+  '| **Feature ID** | `FEAT-NN` — the canonical id of a feature, from its order in the recreation index. |\n' +
+  '| **Slice** | One fine vertical behavior thread within a feature, independently buildable and testable end-to-end. The unit a spec documents. |\n' +
+  '| **Slice ID** | `SL-NNNN` — the canonical id of a slice, from its build order. The only slice identifier used in the kit. |\n' +
+  '| **Build number** | A slice\'s 1-based position in the recommended build order; the `NNNN` in its Slice ID and spec filename. |\n' +
+  '| **Depends on** | The prerequisite slices a slice needs built first, listed by Slice ID. |\n' +
+  '| **Acceptance criteria** | Concrete, language-neutral checks that verify a slice, derived from the source\'s tests. |\n' +
+  '| **Coverage** | `good` / `thin` / `none` — how well the source\'s tests exercise a slice. |\n' +
+  '| **ADR** | Architecture Decision Record — one significant, evidence-backed design decision. |\n' +
+  '| **ADR ID** | `ADR-NNNN` — the canonical id of an ADR. |\n' +
+  '| **Reconstructed** | Marks a document reverse-engineered from observed behavior, not an original artifact. |\n' +
+  '| **`[INFERRED]`** | An intent statement (goal, metric, rationale) guessed from behavior, not observed as fact. |\n' +
+  '| **`[UNVERIFIED]`** | A claim that could not be grounded in the source. |'
+
+// ---------------------------------------------------------------------------
 // Schemas (small, required-tight)
 // ---------------------------------------------------------------------------
 const SYSTEM_MAP = {
   type: 'object',
-  required: ['epics'],
+  required: ['features'],
   properties: {
     languages: { type: 'array', items: { type: 'string' } },
     buildSystem: { type: 'string' },
     testFrameworks: { type: 'array', items: { type: 'string' } },
     testPaths: { type: 'array', items: { type: 'string' } },
     dependencyManifests: { type: 'array', items: { type: 'string' } },
-    epics: {
+    features: {
       type: 'array',
       items: {
         type: 'object',
@@ -618,11 +773,12 @@ const SLICES = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['id', 'name', 'capability'],
+        required: ['id', 'name', 'handle', 'summary'],
         properties: {
           id: { type: 'string' },
           name: { type: 'string' },
-          capability: { type: 'string', description: 'the observable behavior this slice delivers' },
+          handle: { type: 'string', description: 'a TERSE 2-4 word kebab-case descriptor for the filename, e.g. "init-dispatch", "index-bootstrap", "json-flag-parse" — an action/subject handle, NOT a sentence' },
+          summary: { type: 'string', description: 'the observable behavior this slice delivers' },
           thread: {
             type: 'array',
             description: 'every component/layer the slice touches, each with a path:line citation',
@@ -648,9 +804,9 @@ const BEHAVIOR = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['sliceId', 'coverage'],
+        required: ['sliceKey', 'coverage'],
         properties: {
-          sliceId: { type: 'string' },
+          sliceKey: { type: 'string' },
           coverage: { type: 'string', description: 'good | thin | none' },
           acceptanceCriteria: { type: 'array', items: { type: 'string' } },
           testRefs: { type: 'array', items: { type: 'string' }, description: 'path:line of source tests' },
@@ -693,10 +849,11 @@ const ADRS = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['id', 'title', 'evidence'],
+        required: ['id', 'title', 'handle', 'evidence'],
         properties: {
           id: { type: 'string' },
           title: { type: 'string', description: 'the decision, e.g. "Optimistic locking for account updates"' },
+          handle: { type: 'string', description: 'a TERSE 2-4 word kebab-case descriptor for the filename, e.g. "optimistic-locking", "two-file-persistence", "write-acl-matrix" — NOT the full title sentence' },
           evidence: { type: 'array', items: { type: 'string' }, description: 'path:line anchors that prove the decision was made' },
           context: { type: 'string', description: 'observed problem the decision addresses' },
           alternatives: { type: 'array', items: { type: 'string' }, description: 'plausible rejected options (inferred)' },
@@ -754,14 +911,14 @@ const IR_SCHEMA = {
     partitioned: { type: 'boolean', description: 'was over-scale write partitioning engaged?' },
     sysFacts: { type: 'string' },
     fresh: {},
-    epics: { type: 'array', items: {}, description: 'the mapped capability inventory (after the maxEpics cap)' },
-    epicsTotal: { type: 'number', description: 'capabilities discovered BEFORE the maxEpics cap — lets the critic report an intentional maxEpics drop as out-of-scope on resume' },
-    epicsDone: { type: 'array', items: { type: 'string' }, description: 'ids of capabilities whose discovery finished (slice data lives in side-cars, not here)' },
+    features: { type: 'array', items: {}, description: 'the mapped feature inventory (after the maxFeatures cap)' },
+    featuresTotal: { type: 'number', description: 'features discovered BEFORE the maxFeatures cap — lets the critic report an intentional maxFeatures drop as out-of-scope on resume' },
+    featuresDone: { type: 'array', items: { type: 'string' }, description: 'ids of features whose discovery finished (slice data lives in side-cars, not here)' },
     merges: { type: 'array', items: {}, description: 'dedup merge groups (the build order is recomputed from these + the light slices)' },
     adrs: { type: 'array', items: {}, description: 'discovered decisions (authored once)' },
     slicesDiscovered: { type: 'number' },
     slicesOmittedForTest: { type: 'number' },
-    scale: { type: 'object', description: 'the run\'s scale knobs {maxEpics, limitSlices} — resume aborts on a mismatch' },
+    scale: { type: 'object', description: 'the run\'s scale knobs {maxFeatures, limitSlices} — resume aborts on a mismatch' },
     truncations: { type: 'array', items: { type: 'string' }, description: 'cumulative truncation/dedup ledger' },
     written: { type: 'array', items: { type: 'number' }, description: 'build numbers already written' },
     gaps: { type: 'array', items: {}, description: 'critic findings (small; reloaded on a resume past the critic so finalize can report the counts)' },
@@ -821,25 +978,25 @@ log(`Preflight OK: \`${SOURCE}\` is a directory with ${probe.fileCount}${probe.f
 // single-pass run, the first over-scale pass, and every resume pass.
 // (Function declarations hoist, so the resume hook below can call them.)
 // ===========================================================================
-// Feature specs live flat under specs/ with global build-order numbering; the
-// capability grouping (was epics/<epic>/) lives in INDEX.md instead.
+// Slice specs live flat under specs/ with global build-order numbering; the
+// feature grouping (was features/<feature>/) lives in INDEX.md instead.
 function sliceDocPath(s) { return `${OUT}/${specRelPath(s)}` }
 // specRelPath — the spec path RELATIVE to OUT (`specs/<NNNN>-<slug>.md`). Used both to
 // build sliceDocPath (the absolute write target) and as the exact INDEX link target, so
 // the two can never diverge. Derives from specName (the single source of truth).
-function specRelPath(s) { return `specs/${specName(s.n, s.name)}` }
+function specRelPath(s) { return `specs/${specName(s.n, s.handle || s.name)}` }
 
-// Per-capability side-car paths (heavy analysis kept off the checkpoint). One file
-// per capability per kind, each written by the agent that GENERATES it (discovery →
-// slices+thread; behavior → acceptance criteria) and read back by the feature-spec
-// and ACCEPTANCE writers. Keyed by slug(epicId) so the path is filesystem-safe.
-function slicesCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.slices.json` }
-function behaviorCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.behavior.json` }
-// LIGHT per-capability projection (id/name/capability/behaviorSummary/dependsOn — no
-// thread, no criteria). Small enough to reload one capability at a time on resume
+// Per-feature side-car paths (heavy analysis kept off the checkpoint). One file
+// per feature per kind, each written by the agent that GENERATES it (discovery →
+// slices+thread; behavior → acceptance criteria) and read back by the slice-spec
+// and ACCEPTANCE writers. Keyed by slug(featureKey) so the path is filesystem-safe.
+function slicesCarPath(featureKey) { return `${FEATURES_DIR}/${slug(featureKey)}.slices.json` }
+function behaviorCarPath(featureKey) { return `${FEATURES_DIR}/${slug(featureKey)}.behavior.json` }
+// LIGHT per-feature projection (id/name/summary/behaviorSummary/dependsOn — no
+// thread, no criteria). Small enough to reload one feature at a time on resume
 // without a large-string reproduction, so the orchestrator can rebuild its in-memory
 // slice list from artifacts instead of carrying it in the (size-capped) checkpoint.
-function lightCarPath(epicId) { return `${EPICS_DIR}/${slug(epicId)}.light.json` }
+function lightCarPath(featureKey) { return `${FEATURES_DIR}/${slug(featureKey)}.light.json` }
 
 // Reserve enough of the agent budget for the final pass's tail (critic + a little
 // overhead) so writing a full batch can never push the LAST pass over the cap.
@@ -915,33 +1072,30 @@ function pausedAfter(stage, extraCounts = {}) {
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
+    // Canonical DISPLAY fields (JS-owned) the writer transcribes VERBATIM into the metadata header.
+    // The raw key `s.id` stays internal (used only to look up the side-car entries below).
+    const deps = renderDeps(s.dependsOn)
     const ctx = {
-      id: s.id, name: s.name, epicId: s.epicId, buildNumber: s.n,
-      capability: s.capability, behaviorSummary: s.behaviorSummary,
-      dependsOn: s.dependsOn || [],
+      sliceId: sliceId(s.n), name: s.name, buildNumber: s.n,
+      feature: featureRef(s.featureKey) || 'None',
+      dependsOn: deps.length ? deps : ['None'],
+      summary: s.summary, behaviorSummary: s.behaviorSummary,
     }
     return agent(
-      `You are the PortKit FEATURE-SPEC writer. Write ONE self-contained feature spec to \`${path}\`.\n\n` +
+      `You are the PortKit SLICE-SPEC writer. Write ONE self-contained slice spec to \`${path}\`.\n\n` +
       `${FRESH ? rewriteClause(path) : `FIRST: if \`${path}\` already exists and is non-empty, a prior pass already wrote it — do NOT rewrite it; ` +
       `return \`{ "path": "${path}", "ok": true, "selfContained": true }\` immediately (its durable output stands).`}\n\n` +
-      `This feature's heavy analysis is in two side-car files — READ them and pull out ONLY the entry whose ` +
-      `slice id is \`${s.id}\`:\n` +
-      `- Component thread: the slice with \`id == "${s.id}"\` in \`${slicesCarPath(s.epicId)}\` (its \`thread\`).\n` +
-      `- Acceptance criteria: the entry with \`sliceId == "${s.id}"\` in \`${behaviorCarPath(s.epicId)}\` ` +
+      `This slice's heavy analysis is in two side-car files — READ them and pull out ONLY the entry whose ` +
+      `key is \`${s.id}\`:\n` +
+      `- Component thread: the entry with \`id == "${s.id}"\` in \`${slicesCarPath(s.featureKey)}\` (its \`thread\`).\n` +
+      `- Acceptance criteria: the entry with \`sliceKey == "${s.id}"\` in \`${behaviorCarPath(s.featureKey)}\` ` +
       `(\`acceptanceCriteria\`, \`testRefs\`, \`coverage\`). If that file or entry is missing, say coverage is ` +
-      `unknown/none — do NOT invent criteria.\n\n` +
-      `It must let a LESS CAPABLE local model rebuild this feature from this spec + ARCHITECTURE.md ALONE, ` +
-      `without the source. Include, in this order:\n` +
-      `- Title + one-line capability.\n` +
-      `- The end-to-end behavior thread (each component with its source \`path:line\`, from the side-car).\n` +
-      `- Interface/contract: inputs, outputs, and EXACT behavior — every error, edge case, and ordering guarantee.\n` +
-      `- Prerequisite features (build order: this is #${s.n}; dependsOn ${JSON.stringify(s.dependsOn || [])}).\n` +
-      `- Acceptance criteria for THIS feature (from the behavior side-car; concrete and runnable-in-spirit).\n` +
-      `- Function/unit-sized build steps, each individually checkable.\n` +
-      `- Shared conventions (names/types/cross-cutting rules) live in \`${OUT}/ARCHITECTURE.md\` — reference them, ` +
-      `do NOT restate them, and do NOT depend on any other feature's internals.\n\n` +
-      `Re-read the cited source as needed to be exact. Source root: \`${SOURCE}\`.\n\n` +
-      `FEATURE DATA:\n${JSON.stringify(ctx, null, 2)}\n\n${GROUND_RULE}\n\n` +
+      `none — do NOT invent criteria.\n\n` +
+      `The spec must let a LESS CAPABLE local model rebuild this slice from this spec + ARCHITECTURE.md ALONE, ` +
+      `without the source. Re-read the cited source as needed to be exact. Source root: \`${SOURCE}\`.\n\n` +
+      `${HOUSE_STYLE}\n\n${SLICE_SPEC_TEMPLATE}\n\n` +
+      `Fill the skeleton from this data (metadata fields are AUTHORITATIVE — transcribe the ids VERBATIM, ` +
+      `do NOT alter them):\nSLICE DATA:\n${JSON.stringify(ctx, null, 2)}\n\n${GROUND_RULE}\n\n` +
       `After writing, return the path, whether it is genuinely self-contained, and any issues.`,
       { schema: WROTE, phase: 'Write specs', label: `slice:${s.n}:${slug(s.name)}` }
     )
@@ -953,9 +1107,9 @@ async function writeSliceDocs(sliceList) {
 // tests and WRITE the behavior side-car. Deliberately SEPARATE from discovery so a resume
 // can fill a MISSING behavior spec against ALREADY-DISCOVERED slices (reloaded from
 // light.json) WITHOUT re-discovering — and thus renumbering — the slice set. `slices` carry
-// at least { id, name, capability }; a capability with no slices needs no behavior side-car.
-async function runBehaviorSpec(epicId, slices, sysFacts) {
-  const ids = (slices || []).map(s => ({ id: s.id, name: s.name, capability: s.capability }))
+// at least { id, name, feature }; a feature with no slices needs no behavior side-car.
+async function runBehaviorSpec(featureKey, slices, sysFacts) {
+  const ids = (slices || []).map(s => ({ id: s.id, name: s.name, summary: s.summary }))
   if (ids.length === 0) return
   await agent(
     `You are the PortKit BEHAVIOR-SPEC agent. The source's existing tests are the behavioral contract.\n\n` +
@@ -963,49 +1117,51 @@ async function runBehaviorSpec(epicId, slices, sysFacts) {
     `For each slice below, find the source tests that exercise it and translate them into LANGUAGE-NEUTRAL ` +
     `acceptance criteria (concrete enough that a weak model can self-check its rebuild). Cite each source test ` +
     `as \`path:line\`. Rate coverage good/thin/none. FLAG thin/none LOUDLY — never paper over missing coverage.\n\n` +
-    `WRITE the result as JSON \`{ "perSlice": [ { "sliceId", "coverage", "acceptanceCriteria": [...], "testRefs": [...] } ] }\` ` +
-    `to \`${behaviorCarPath(epicId)}\` (create parent directories first). This side-car is read later by the ` +
-    `ACCEPTANCE and feature-spec writers — write the file, do not just return.\n\n` +
+    `WRITE the result as JSON \`{ "perSlice": [ { "sliceKey", "coverage", "acceptanceCriteria": [...], "testRefs": [...] } ] }\` ` +
+    `to \`${behaviorCarPath(featureKey)}\` (create parent directories first). This side-car is read later by the ` +
+    `ACCEPTANCE and slice-spec writers — write the file, do not just return.\n\n` +
     `SLICES:\n${JSON.stringify(ids, null, 2)}\n\n${GROUND_RULE}\n\nReturn perSlice behavioral specs.`,
-    { schema: BEHAVIOR, phase: 'Discover slices', label: `behavior:${epicId}` }
+    { schema: BEHAVIOR, phase: 'Discover slices', label: `behavior:${featureKey}` }
   )
 }
 
-// Discover ONE capability end-to-end: trace it into fine vertical slices (features),
+// Discover ONE feature end-to-end: trace it into fine vertical slices (slices),
 // then extract each slice's behavioral acceptance spec from the test suite. Returns
-// { epicId, slices } — or null if the discovery agent itself failed, so a failed
-// capability is retried on the next resume rather than silently lost. A capability that
-// legitimately has no slices returns { epicId, slices: [] } (done, not retried).
-async function discoverEpic(epic, sysFacts) {
+// { featureKey, slices } — or null if the discovery agent itself failed, so a failed
+// feature is retried on the next resume rather than silently lost. A feature that
+// legitimately has no slices returns { featureKey, slices: [] } (done, not retried).
+async function discoverFeature(feature, sysFacts) {
   const r = await agent(
-    `You are the PortKit SLICE-DISCOVERY agent for ONE capability of the source at \`${SOURCE}\`.\n\n` +
-    `EPIC: ${JSON.stringify(epic)}\n\n` +
-    `Trace this capability END-TO-END through every layer it touches (entry → validation → business rule → ` +
+    `You are the PortKit SLICE-DISCOVERY agent for ONE feature of the source at \`${SOURCE}\`.\n\n` +
+    `FEATURE: ${JSON.stringify(feature)}\n\n` +
+    `Trace this feature END-TO-END through every layer it touches (entry → validation → business rule → ` +
     `data model → persistence → response/side-effects). Decompose it into fine, FUNCTION/UNIT-SIZED VERTICAL ` +
     `SLICES — each an independently buildable & testable thread. For each slice give: a stable id (prefix with ` +
-    `the epic id), name, the observable capability, the \`thread\` (components touched, each with a \`path:line\` ` +
-    `citation), a precise behaviorSummary, and dependsOn (other slice ids it needs first).\n\n` +
+    `the feature id), name, a TERSE 2-4 word kebab-case \`handle\` (used for the filename — an action/subject ` +
+    `descriptor like "init-dispatch" or "json-flag-parse", NOT a sentence), the observable behavior, the \`thread\` ` +
+    `(components touched, each with a \`path:line\` citation), a precise behaviorSummary, and dependsOn (other slice ` +
+    `ids it needs first).\n\n` +
     `Then WRITE two side-car files (create parent directories first with \`mkdir -p\`):\n` +
-    `1. \`${slicesCarPath(epic.id)}\` — the FULL slices array (every field, INCLUDING each slice's \`thread\`). ` +
-    `This is the feature-spec writer's source for the component thread.\n` +
-    `2. \`${lightCarPath(epic.id)}\` — a LIGHT projection: a JSON array of ` +
-    `\`{ "id", "name", "capability", "behaviorSummary", "dependsOn" }\` for the same slices (NO thread). This lets a ` +
-    `resume rebuild the build graph cheaply.\n` +
+    `1. \`${slicesCarPath(feature.id)}\` — the FULL slices array (every field, INCLUDING each slice's \`thread\`). ` +
+    `This is the slice-spec writer's source for the component thread.\n` +
+    `2. \`${lightCarPath(feature.id)}\` — a LIGHT projection: a JSON array of ` +
+    `\`{ "id", "name", "handle", "summary", "behaviorSummary", "dependsOn" }\` for the same slices (NO thread). This ` +
+    `lets a resume rebuild the build graph cheaply.\n` +
     `Write BOTH files — do not just return.\n\n` +
     `${GROUND_RULE}\n\nReturn the slices.`,
-    { schema: SLICES, phase: 'Discover slices', label: `discover:${epic.id}` }
+    { schema: SLICES, phase: 'Discover slices', label: `discover:${feature.id}` }
   )
-  const prev = r ? { epicId: epic.id, slices: r.slices || [] } : null
+  const prev = r ? { featureKey: feature.id, slices: r.slices || [] } : null
   if (!prev || prev.slices.length === 0) return prev
-  // LIGHT per-epic result ONLY — the bulky thread + acceptance criteria live in the
+  // LIGHT per-feature result ONLY — the bulky thread + acceptance criteria live in the
   // side-cars (written by the discovery + behavior agents), never in the checkpoint
   // (that is what kept persist small enough to succeed). Heavy consumers read from disk.
   const lightSlices = prev.slices.map((s) => ({
-    id: s.id, name: s.name, capability: s.capability,
+    id: s.id, name: s.name, handle: s.handle, summary: s.summary,
     behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [],
   }))
-  await runBehaviorSpec(epic.id, lightSlices, sysFacts)
-  return { epicId: epic.id, slices: lightSlices }
+  await runBehaviorSpec(feature.id, lightSlices, sysFacts)
+  return { featureKey: feature.id, slices: lightSlices }
 }
 
 async function runCritic(scopeNote = '') {
@@ -1019,8 +1175,8 @@ async function runCritic(scopeNote = '') {
       `- Thin/missing test coverage not flagged in \`${OUT}/ACCEPTANCE.md\`.\n` +
       `- \`[INFERRED]\` misuse: an inference (goal, metric, rationale, "why") asserted as observed fact, OR an ` +
       `observed fact left uncited. Check PRD.md and every adr/*.md especially.\n` +
-      `- Feature specs that are NOT actually self-contained or not end-to-end testable.\n` +
-      `- Missing pieces (a capability with no feature spec, a dangling dependsOn, a spec with no acceptance criteria).\n\n` +
+      `- Slice specs that are NOT actually self-contained or not end-to-end testable.\n` +
+      `- Missing pieces (a feature with no slice spec, a dangling dependsOn, a spec with no acceptance criteria).\n\n` +
       (prior ? `Previously reported gaps that fix agents attempted:\n${prior}\n\n` : '') +
       `Append findings to \`${OUT}/RISKS-AND-GAPS.md\` (create if absent; this is round ${round}). ` +
       `Mark each gap fixable=true only if an agent could resolve it WITHOUT human input.\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn the gaps.`
@@ -1110,9 +1266,9 @@ async function runDistill(docPaths) {
 
 // IR persistence — the checkpoint mechanism. The orchestrator sandbox has no
 // filesystem, so an agent writes/reads/deletes the JSON. The checkpoint is now SMALL
-// (heavy analysis lives in generator-written side-cars, see EPICS_DIR), so a single
+// (heavy analysis lives in generator-written side-cars, see FEATURES_DIR), so a single
 // agent can write it verbatim / read it back structured without stalling — the thing
-// that broke when the full accumulator went through here (see the EPICS_DIR note).
+// that broke when the full accumulator went through here (see the FEATURES_DIR note).
 async function persistIR(ir) {
   await agent(
     `You are the PortKit IR-PERSIST agent. Create the directory if needed and write the JSON between the fences ` +
@@ -1132,42 +1288,42 @@ async function loadIR() {
 async function clearIR() {
   await agent(
     `You are the PortKit IR-CLEAR agent. The run is complete, so remove the whole checkpoint directory (the ` +
-    `checkpoint JSON AND the per-capability side-cars) so a later run starts fresh instead of auto-resuming a ` +
+    `checkpoint JSON AND the per-feature side-cars) so a later run starts fresh instead of auto-resuming a ` +
     `finished run: \`rm -rf "$(dirname "${IR_PATH}")"\`. Return when done.`,
     { phase: 'Checkpoint', label: 'ir:clear' }
   )
 }
 // Resume helpers — completion is judged by the DURABLE ARTIFACTS on disk, not by the
 // checkpoint, so no already-finished agent is ever re-run even if the checkpoint lagged.
-// scanEpicSidecars: for EACH capability under EPICS_DIR, which side-cars exist. Slice
+// scanFeatureSidecars: for EACH feature under FEATURES_DIR, which side-cars exist. Slice
 // STRUCTURE (light.json) and the BEHAVIOR spec (behavior.json) are INDEPENDENT artifacts —
 // reporting them separately (rather than a single "both present = done" flag) lets
 // planResume() reload durable structure and re-run ONLY a missing behavior spec, instead of
-// re-discovering (and renumbering) a capability just because its behavior agent had failed.
-// loadEpicLight: rebuild ONE capability's light slice list from its small light.json
+// re-discovering (and renumbering) a feature just because its behavior agent had failed.
+// loadFeatureLight: rebuild ONE feature's light slice list from its small light.json
 // (a small read, never the heavy slices.json).
-async function scanEpicSidecars() {
+async function scanFeatureSidecars() {
   const r = await agent(
-    `You are the PortKit RESUME-SCAN agent. List \`${EPICS_DIR}\` (it may not exist — then return \`{"epics": []}\`). ` +
-    `A capability id is a side-car file name with its \`.light.json\`, \`.slices.json\`, or \`.behavior.json\` suffix ` +
-    `removed. For EVERY distinct capability id present, report which side-cars exist. Return ` +
-    `\`{"epics": [ { "id": <id>, "hasLight": <true iff <id>.light.json exists>, "hasBehavior": <true iff <id>.behavior.json exists> } ]}\`.`,
-    { schema: { type: 'object', properties: { epics: { type: 'array', items: {
+    `You are the PortKit RESUME-SCAN agent. List \`${FEATURES_DIR}\` (it may not exist — then return \`{"features": []}\`). ` +
+    `A feature id is a side-car file name with its \`.light.json\`, \`.slices.json\`, or \`.behavior.json\` suffix ` +
+    `removed. For EVERY distinct feature id present, report which side-cars exist. Return ` +
+    `\`{"features": [ { "id": <id>, "hasLight": <true iff <id>.light.json exists>, "hasBehavior": <true iff <id>.behavior.json exists> } ]}\`.`,
+    { schema: { type: 'object', properties: { features: { type: 'array', items: {
         type: 'object',
         properties: { id: { type: 'string' }, hasLight: { type: 'boolean' }, hasBehavior: { type: 'boolean' } },
         required: ['id', 'hasLight', 'hasBehavior'] } } } },
       phase: 'Discover slices', label: 'resume:scan' }
   )
-  return (r && Array.isArray(r.epics)) ? r.epics : []
+  return (r && Array.isArray(r.features)) ? r.features : []
 }
-async function loadEpicLight(epicId) {
+async function loadFeatureLight(featureKey) {
   const r = await agent(
-    `You are the PortKit LIGHT-LOAD agent. Read \`${lightCarPath(epicId)}\` and return \`{"slices": <its JSON array>}\` ` +
+    `You are the PortKit LIGHT-LOAD agent. Read \`${lightCarPath(featureKey)}\` and return \`{"slices": <its JSON array>}\` ` +
     `EXACTLY (do not alter). If the file is missing or empty, return \`{"slices": []}\`.`,
     { schema: { type: 'object', properties: { slices: { type: 'array', items: {} } } },
-      phase: 'Discover slices', label: `light:${epicId}` }
+      phase: 'Discover slices', label: `light:${featureKey}` }
   )
-  return { epicId, slices: (r && Array.isArray(r.slices)) ? r.slices : [] }
+  return { featureKey, slices: (r && Array.isArray(r.slices)) ? r.slices : [] }
 }
 
 // The single mutable checkpoint object. saveStage() merges a phase's output into it,
@@ -1177,14 +1333,14 @@ async function loadEpicLight(epicId) {
 let checkpoint = null
 async function saveStage(stage, patch = {}) {
   // Carry the truncation ledger into every checkpoint so a resume can re-seed it —
-  // otherwise notes from earlier passes (capped epics, dedup/cycle notes) would be
+  // otherwise notes from earlier passes (capped features, dedup/cycle notes) would be
   // lost and the final result would under-report what was dropped.
   checkpoint = { ...(checkpoint || {}), ...patch, stage, truncations: dropped }
   await persistIR(checkpoint)
   return checkpoint
 }
 
-// Write-specs stage. Writes the next un-written batch of feature specs and returns a
+// Write-specs stage. Writes the next un-written batch of slice specs and returns a
 // CONTROL object: { done: true } when every spec is written (the caller proceeds to the
 // critic stage), or { done: false, result } for a resumable stop (over-scale partition,
 // token yield, or partial-failure) that the caller must RETURN verbatim. `partitioned`
@@ -1216,26 +1372,26 @@ async function runWriteSpecs({ ordered, partitioned, priorWritten = [], extraCou
     let thisPass = pending
     if (partitioned && tokenBudgetSet()) {
       // Token chunking: take the next `perBatch` specs in build order. Specs are independent
-      // files, so we batch at SLICE granularity here (not epic) — this bounds the per-pass
-      // overshoot to ~maxConcurrency specs even inside one very large capability. Build order is
+      // files, so we batch at SLICE granularity here (not feature) — this bounds the per-pass
+      // overshoot to ~maxConcurrency specs even inside one very large feature. Build order is
       // preserved (pending is ordered), so prerequisites still precede dependents.
       thisPass = pending.slice(0, perBatch)
     } else if (partitioned) {
-      // Agent over-scale (no token budget): keep whole capabilities together per pass.
-      const batch = planEpicBatches(buildEpicTree(pending), perBatch)[0]
+      // Agent over-scale (no token budget): keep whole features together per pass.
+      const batch = planFeatureBatches(buildFeatureTree(pending), perBatch)[0]
       const ids = new Set((batch && batch.sliceIds) || [])
       thisPass = pending.filter(s => ids.has(s.id))
     }
 
     const docs = await writeSliceDocs(thisPass)
-    // Mark only features that actually wrote OK as done; failures stay pending and are
+    // Mark only slices that actually wrote OK as done; failures stay pending and are
     // retried on the next pass (so a flaky write is never silently lost).
     const okThisPass = thisPass.filter((s, i) => docs[i] && docs[i].ok)
     okThisPass.forEach(s => writtenNs.add(s.n))
     if (okThisPass.length) didWorkThisTurn = true
     wroteThisInvocation += okThisPass.length
     const remaining = ordered.filter(s => !writtenNs.has(s.n)).length
-    log(`Wrote ${okThisPass.length}/${thisPass.length} feature spec(s)` +
+    log(`Wrote ${okThisPass.length}/${thisPass.length} slice spec(s)` +
       (partitioned ? ` — ${writtenNs.size}/${ordered.length} done, ${remaining} remaining` : ''))
 
     // Persist write progress before returning ANY resumeRequired result (over-scale partition,
@@ -1248,7 +1404,7 @@ async function runWriteSpecs({ ordered, partitioned, priorWritten = [], extraCou
     // No-progress guard: a partitioned batch that wrote nothing but has work left would loop
     // forever (across resumes AND within this while-loop). Stop loudly.
     if (partitioned && okThisPass.length === 0 && remaining > 0) {
-      const err = `Write pass made no progress: all ${thisPass.length} write(s) failed, ${remaining} feature(s) still pending${tokenBudgetSet() ? ' (token-budget chunked run)' : ''}.`
+      const err = `Write pass made no progress: all ${thisPass.length} write(s) failed, ${remaining} slice(s) still pending${tokenBudgetSet() ? ' (token-budget chunked run)' : ''}.`
       log(`❌ ${err}`); dropped.push(err)
       return { done: false, result: { ok: false, error: err, outDir: OUT, resumeRequired: true, truncations: dropped } }
     }
@@ -1261,7 +1417,7 @@ async function runWriteSpecs({ ordered, partitioned, priorWritten = [], extraCou
     const stopForBudget = tokenBudgetSet() && shouldYieldForBudget()
     const stopForAgentCap = wroteThisInvocation >= agentWriteBudget
     if (!tokenBudgetSet() || stopForBudget || stopForAgentCap) {
-      const note = `${remaining} feature spec(s) remain after this ${stopForBudget ? 'token-budget ' : ''}pass — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (nothing dropped).`
+      const note = `${remaining} slice spec(s) remain after this ${stopForBudget ? 'token-budget ' : ''}pass — re-run with { resume: true } pointed at outputDir "${OUT}" to continue (nothing dropped).`
       log(`⏸️  ${note}`); dropped.push(note)
       return { done: false, result: {
         ok: true, outDir: OUT, resumeRequired: true,
@@ -1307,6 +1463,7 @@ async function finalize({ ordered, adrs = [], gaps = [], distill = null, extraCo
       architecture: `${OUT}/ARCHITECTURE.md`,
       index: `${OUT}/INDEX.md`,
       acceptance: `${OUT}/ACCEPTANCE.md`,
+      glossary: `${OUT}/GLOSSARY.md`,
       adrDir: `${OUT}/adr/`,
       risks: `${OUT}/RISKS-AND-GAPS.md`,
       ...(distill ? { distilledDir: `${OUT}/distilled/` } : {}),
@@ -1332,18 +1489,18 @@ if (!cfg.fresh) {
     if (loaded.source && loaded.source !== SOURCE) {
       log(`⚠️  Ignoring checkpoint at \`${IR_PATH}\`: it belongs to a different source (\`${loaded.source}\` ≠ \`${SOURCE}\`). Starting fresh — use --output for a separate dir to keep both.`)
     } else if (loaded.scale &&
-      ((loaded.scale.maxEpics ?? MAX_EPICS) !== MAX_EPICS || (loaded.scale.limitSlices ?? LIMIT_SLICES) !== LIMIT_SLICES)) {
+      ((loaded.scale.maxFeatures ?? MAX_FEATURES) !== MAX_FEATURES || (loaded.scale.limitSlices ?? LIMIT_SLICES) !== LIMIT_SLICES)) {
       // Scope MISMATCH: the checkpoint was built with different scale knobs. Resuming would reuse
-      // the checkpoint's (capped) epic list and limitSlices, silently continuing the smaller scope
+      // the checkpoint's (capped) feature list and limitSlices, silently continuing the smaller scope
       // with this run's flags. Abort loudly rather than produce a Frankenstein kit.
       return {
         ok: false,
-        error: `Checkpoint at \`${IR_PATH}\` was built with maxEpics=${loaded.scale.maxEpics}, limitSlices=${loaded.scale.limitSlices}; ` +
-          `this run uses maxEpics=${MAX_EPICS}, limitSlices=${LIMIT_SLICES}. Resuming would keep the checkpoint's smaller scope, ` +
+        error: `Checkpoint at \`${IR_PATH}\` was built with maxFeatures=${loaded.scale.maxFeatures}, limitSlices=${loaded.scale.limitSlices}; ` +
+          `this run uses maxFeatures=${MAX_FEATURES}, limitSlices=${LIMIT_SLICES}. Resuming would keep the checkpoint's smaller scope, ` +
           `not your new flags. Use { fresh: true } with a clean or new outputDir for a full run, or re-run with the same scale knobs to continue this checkpoint.`,
         outDir: OUT,
         checkpointScale: loaded.scale,
-        requestedScale: { maxEpics: MAX_EPICS, limitSlices: LIMIT_SLICES },
+        requestedScale: { maxFeatures: MAX_FEATURES, limitSlices: LIMIT_SLICES },
       }
     } else {
       checkpoint = loaded
@@ -1370,16 +1527,16 @@ const RESUMING = !!checkpoint
 const savedStage = checkpoint ? checkpoint.stage : null
 
 // ===========================================================================
-// Stage: Map — survey the repo + draft the capability inventory.
+// Stage: Map — survey the repo + draft the feature inventory.
 // ===========================================================================
-let sysFacts, epics, epicsTotal
+let sysFacts, features, featuresTotal
 if (RESUMING && stageDone(savedStage, 'mapped')) {
   sysFacts = checkpoint.sysFacts || '{}'
-  epics = checkpoint.epics || []
+  features = checkpoint.features || []
   // Pre-cap total for the critic's intentional-omission scope note; fall back to the kept
-  // count for pre-epicsTotal checkpoints (⇒ no false "capabilities dropped" claim).
-  epicsTotal = checkpoint.epicsTotal ?? epics.length
-  log(`Skipping map (checkpointed): ${epics.length} capability(ies).`)
+  // count for pre-featuresTotal checkpoints (⇒ no false "features dropped" claim).
+  featuresTotal = checkpoint.featuresTotal ?? features.length
+  log(`Skipping map (checkpointed): ${features.length} feature(ies).`)
 } else {
   phase('Map')
   const map = await agent(
@@ -1388,19 +1545,19 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
   `report it — do NOT survey any other directory or substitute a different path.\n\n` +
   `Tasks:\n` +
   `1. Identify languages, build system, test framework(s) and where tests live, and the dependency manifest file(s).\n` +
-  `2. Discover the CAPABILITIES of the system as a DRAFT CAPABILITY INVENTORY — coarse, user/externally-observable ` +
+  `2. Discover the FEATURES of the system as a DRAFT FEATURE INVENTORY — coarse, user/externally-observable ` +
   `behaviors (HTTP endpoints, CLI commands, public API operations, event/message handlers, scheduled jobs, UI flows). ` +
   `These are VERTICAL threads, NOT horizontal layers. Do NOT list "the models" or "the controllers" — list what the ` +
   `system DOES. Give each a stable id, a name, a kind, and entry-point \`path:line\` anchors.\n\n` +
   `Return ONLY the structured inventory as data — do NOT write any file (ARCHITECTURE.md is authored later from this ` +
-  `data plus the discovered features).\n\n` +
+  `data plus the discovered slices).\n\n` +
   `${GROUND_RULE}\n\nReturn the structured inventory.`,
     { schema: SYSTEM_MAP, phase: 'Map', label: 'map:survey' }
   )
-  if (!map || !Array.isArray(map.epics) || map.epics.length === 0) {
+  if (!map || !Array.isArray(map.features) || map.features.length === 0) {
     return {
       ok: false,
-      error: 'Map phase produced no capabilities — cannot build a recreation kit.',
+      error: 'Map phase produced no features — cannot build a recreation kit.',
       outDir: OUT,
     }
   }
@@ -1409,76 +1566,76 @@ if (RESUMING && stageDone(savedStage, 'mapped')) {
     testFrameworks: map.testFrameworks, testPaths: map.testPaths,
     dependencyManifests: map.dependencyManifests,
   }, null, 2)
-  epicsTotal = map.epics.length
-  epics = cap(map.epics, MAX_EPICS, 'epics')
-  log(`Mapped ${map.epics.length} capability(ies); analyzing ${epics.length}.`)
+  featuresTotal = map.features.length
+  features = cap(map.features, MAX_FEATURES, 'features')
+  log(`Mapped ${map.features.length} feature(ies); analyzing ${features.length}.`)
   // Persist the scale knobs so a later resume can detect a scope MISMATCH (e.g. resuming a
-  // maxEpics=5/limitSlices=3 smoke-test checkpoint with a full-run command) and refuse to silently
-  // continue the smaller scope — the exact trap that produced the 5-epic Frankenstein kit.
-  // epicsTotal (pre-cap) rides along so the critic can flag an intentional maxEpics drop even on resume.
+  // maxFeatures=5/limitSlices=3 smoke-test checkpoint with a full-run command) and refuse to silently
+  // continue the smaller scope — the exact trap that produced the 5-feature Frankenstein kit.
+  // featuresTotal (pre-cap) rides along so the critic can flag an intentional maxFeatures drop even on resume.
   await saveStage('mapped', {
-    source: SOURCE, fileCount: probe.fileCount, sysFacts, epics, epicsTotal,
-    scale: { maxEpics: MAX_EPICS, limitSlices: LIMIT_SLICES },
+    source: SOURCE, fileCount: probe.fileCount, sysFacts, features, featuresTotal,
+    scale: { maxFeatures: MAX_FEATURES, limitSlices: LIMIT_SLICES },
   })
 }
 // Phase ceiling: /portkit-map stops here. Placed OUTSIDE the if/else so it fires on a
 // resume that skipped the map agent too (re-running /portkit-map just re-reports).
-if (stopAfter('mapped', UNTIL)) return pausedAfter('mapped', { epics: epics.length })
+if (stopAfter('mapped', UNTIL)) return pausedAfter('mapped', { features: features.length })
 
 // ===========================================================================
-// Stage: Discover — per capability, trace slices + extract the behavioral spec.
-// Processed in CHECKPOINTED batches (CHECKPOINT_EVERY capabilities per batch): after
+// Stage: Discover — per feature, trace slices + extract the behavioral spec.
+// Processed in CHECKPOINTED batches (CHECKPOINT_EVERY features per batch): after
 // each batch the checkpoint advances, so an interruption keeps every already-analyzed
-// capability instead of restarting the whole (most expensive) discovery phase.
+// feature instead of restarting the whole (most expensive) discovery phase.
 // ===========================================================================
-// perEpicDone holds LIGHT slices in memory (fresh: from discovery returns; resume:
+// perFeatureDone holds LIGHT slices in memory (fresh: from discovery returns; resume:
 // rebuilt from the light side-cars). On resume, completion is judged by the durable
-// side-cars — NOT the checkpoint — so no finished capability is ever re-analyzed. We
-// rebuild in `epics` order (not filesystem order) so the downstream build numbering is
+// side-cars — NOT the checkpoint — so no finished feature is ever re-analyzed. We
+// rebuild in `features` order (not filesystem order) so the downstream build numbering is
 // identical to a fresh run, keeping already-written spec file names valid.
-let perEpicDone = []
+let perFeatureDone = []
 if (RESUMING && stageDone(savedStage, 'mapped')) {
-  const plan = planResume(epics, await scanEpicSidecars())
+  const plan = planResume(features, await scanFeatureSidecars())
   if (plan.reload.length) {
-    // Structure is durable + deterministic: reload EVERY capability that has a light.json
-    // (in `epics` order, so numbering matches a fresh run) — NEVER re-discover it, which
+    // Structure is durable + deterministic: reload EVERY feature that has a light.json
+    // (in `features` order, so numbering matches a fresh run) — NEVER re-discover it, which
     // would change the slice set and renumber every downstream spec.
-    perEpicDone = (await pooled(plan.reload.map(id => () => loadEpicLight(id)))).filter(Boolean)
-    // A capability whose behavior side-car is missing (its behavior agent failed on a prior
+    perFeatureDone = (await pooled(plan.reload.map(id => () => loadFeatureLight(id)))).filter(Boolean)
+    // A feature whose behavior side-car is missing (its behavior agent failed on a prior
     // pass) re-runs ONLY the behavior agent, against the reloaded slices — structure and
     // numbering are untouched, so already-written specs keep matching their build numbers.
     const fill = new Set(plan.behaviorOnly)
-    const behaviorTodo = perEpicDone.filter(e => e && e.slices.length && fill.has(e.epicId))
+    const behaviorTodo = perFeatureDone.filter(e => e && e.slices.length && fill.has(e.featureKey))
     if (behaviorTodo.length) {
-      log(`Reusing ${perEpicDone.length} capability(ies) from durable side-cars (structure unchanged); re-running behavior-spec only for ${behaviorTodo.length} missing a behavior side-car.`)
-      await pooled(behaviorTodo.map(e => () => runBehaviorSpec(e.epicId, e.slices, sysFacts)))
+      log(`Reusing ${perFeatureDone.length} feature(ies) from durable side-cars (structure unchanged); re-running behavior-spec only for ${behaviorTodo.length} missing a behavior side-car.`)
+      await pooled(behaviorTodo.map(e => () => runBehaviorSpec(e.featureKey, e.slices, sysFacts)))
     } else {
-      log(`Reusing ${perEpicDone.length} capability(ies) already analyzed by a prior run (from side-cars).`)
+      log(`Reusing ${perFeatureDone.length} feature(ies) already analyzed by a prior run (from side-cars).`)
     }
   }
 }
 if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
   phase('Discover slices')
-  const doneIds = new Set(perEpicDone.map(e => e && e.epicId))
-  const todo = epics.filter(e => !doneIds.has(e.id))
-  if (perEpicDone.length) log(`Discovery resuming: ${perEpicDone.length} done, ${todo.length} capability(ies) to analyze.`)
+  const doneIds = new Set(perFeatureDone.map(e => e && e.featureKey))
+  const todo = features.filter(e => !doneIds.has(e.id))
+  if (perFeatureDone.length) log(`Discovery resuming: ${perFeatureDone.length} done, ${todo.length} feature(ies) to analyze.`)
   for (const group of chunk(todo, CHECKPOINT_EVERY)) {
-    const results = await pooled(group.map((epic) => () => discoverEpic(epic, sysFacts)))
-    perEpicDone.push(...results.filter(Boolean))
+    const results = await pooled(group.map((feature) => () => discoverFeature(feature, sysFacts)))
+    perFeatureDone.push(...results.filter(Boolean))
     didWorkThisTurn = true // a discovery batch completed this turn — the progress guard is now armed
-    // TINY checkpoint: advance the stage + record only WHICH capabilities are done
+    // TINY checkpoint: advance the stage + record only WHICH features are done
     // (their ids). The slice data itself lives in the durable side-cars, never here.
-    await saveStage('discovering', { epicsDone: perEpicDone.map(e => e.epicId) })
+    await saveStage('discovering', { featuresDone: perFeatureDone.map(e => e.featureKey) })
     // Voluntary token-budget yield: discovery is the dominant early cost and is fully
-    // mid-phase resumable (side-cars + epicsDone), so this is the cheapest place to chunk a
+    // mid-phase resumable (side-cars + featuresDone), so this is the cheapest place to chunk a
     // very large project. The just-checkpointed batch is durable before we stop.
-    if (budgetYieldNow()) return yieldForBudget('discovering', { epicsDiscovered: perEpicDone.length })
+    if (budgetYieldNow()) return yieldForBudget('discovering', { featuresDiscovered: perFeatureDone.length })
   }
-  await saveStage('discovered', { epicsDone: perEpicDone.map(e => e.epicId) })
-  if (budgetYieldNow()) return yieldForBudget('discovered', { epicsDiscovered: perEpicDone.length })
+  await saveStage('discovered', { featuresDone: perFeatureDone.map(e => e.featureKey) })
+  if (budgetYieldNow()) return yieldForBudget('discovered', { featuresDiscovered: perFeatureDone.length })
 }
 // Phase ceiling: /portkit-discover stops here (outside the block so it fires on resume too).
-if (stopAfter('discovered', UNTIL)) return pausedAfter('discovered', { epicsDiscovered: perEpicDone.length })
+if (stopAfter('discovered', UNTIL)) return pausedAfter('discovered', { featuresDiscovered: perFeatureDone.length })
 
 // ===========================================================================
 // Stage: Synthesize — dedup (the one job needing judgment); the mechanical graph
@@ -1496,9 +1653,9 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
   // Flatten light slices (fresh: from discovery returns; resume: rebuilt from side-cars).
   // Heavy thread/behavior stay in side-cars, read from disk by the spec/ACCEPTANCE writers.
   const slices = []
-  for (const e of perEpicDone) {
+  for (const e of perFeatureDone) {
     if (!e) continue
-    for (const s of (e.slices || [])) slices.push({ ...s, epicId: e.epicId })
+    for (const s of (e.slices || [])) slices.push({ ...s, featureKey: e.featureKey })
   }
   if (slices.length === 0) {
     return { ok: false, error: 'No vertical slices were discovered.', outDir: OUT }
@@ -1513,15 +1670,15 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
     merges = checkpoint.merges
     log(`Skipping synthesis (checkpointed merges): rebuilding build order for ${slices.length} slice(s).`)
   } else {
-    log(`Discovered ${slices.length} feature(s) across ${perEpicDone.filter(Boolean).length} capability(ies).`)
+    log(`Discovered ${slices.length} slice(s) across ${perFeatureDone.filter(Boolean).length} feature(ies).`)
     phase('Synthesize')
     const synthInput = slices.map(s => ({
-      id: s.id, name: s.name, epicId: s.epicId, capability: s.capability, behaviorSummary: s.behaviorSummary,
+      id: s.id, name: s.name, featureKey: s.featureKey, summary: s.summary, behaviorSummary: s.behaviorSummary,
     }))
     const synth = await agent(
-      `You are the PortKit SYNTHESIS agent. You receive ALL discovered vertical slices (features) in compact form.\n\n` +
+      `You are the PortKit SYNTHESIS agent. You receive ALL discovered vertical slices (slices) in compact form.\n\n` +
       `Do ONE thing — DEDUP: identify sets of slices that are truly the SAME vertical thread discovered from different ` +
-      `capabilities/angles. For each set return a merge group { keep, merge: [ids…] } — \`keep\` is the surviving ` +
+      `features/angles. For each set return a merge group { keep, merge: [ids…] } — \`keep\` is the surviving ` +
       `canonical slice id, \`merge\` lists the OTHER ids folded into it. Only merge GENUINE duplicates; when in doubt ` +
       `do NOT merge (a wrongly-merged slice silently loses real behavior). Return an empty list if nothing merges. Do ` +
       `NOT compute a build order and do NOT renumber — ordering is handled deterministically downstream.\n\n` +
@@ -1548,7 +1705,7 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
   const mergedCount = slices.length - orderedFull.length
   ordered = orderedFull
 
-  // DEV/TEST cost cap (opt-in, LOUD). Keep only the first N features in build order;
+  // DEV/TEST cost cap (opt-in, LOUD). Keep only the first N slices in build order;
   // topo order means prerequisites are kept, so the trimmed kit stays consistent.
   if (LIMIT_SLICES > 0 && ordered.length > LIMIT_SLICES) {
     slicesOmittedForTest = ordered.length - LIMIT_SLICES
@@ -1562,8 +1719,8 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
     for (const note of topo.notes) { log(`⚠️  build-order: ${note}`); dropped.push(note) }
     if (mergedCount > 0) log(`Synthesis merged ${mergedCount} duplicate slice(s); ${orderedFull.length} canonical slice(s) remain.`)
     if (slicesOmittedForTest > 0) {
-      const note = `🧪 TEST LIMIT: writing only ${ordered.length} of ${orderedFull.length} feature(s) (limitSlices=${LIMIT_SLICES}). ` +
-        `PARTIAL end-to-end TEST kit — NOT a complete recreation kit; ${slicesOmittedForTest} feature(s) intentionally omitted.`
+      const note = `🧪 TEST LIMIT: writing only ${ordered.length} of ${orderedFull.length} slice(s) (limitSlices=${LIMIT_SLICES}). ` +
+        `PARTIAL end-to-end TEST kit — NOT a complete recreation kit; ${slicesOmittedForTest} slice(s) intentionally omitted.`
       log(note); dropped.push(note)
     }
     await saveStage('synthesized', { merges, sysFacts, slicesDiscovered, slicesOmittedForTest })
@@ -1578,6 +1735,27 @@ let ordered, slicesDiscovered, slicesOmittedForTest = 0
   if (budgetYieldNow()) return yieldForBudget('synthesized', { slicesDiscovered })
 }
 
+// ---------------------------------------------------------------------------
+// Canonical DISPLAY-id lookups (JS-owned, deterministic). The raw discovery keys wire the
+// build graph; these turn a key into the id a reader sees. Built ONCE here — after `ordered`
+// is finalized and before BOTH the doc family and the write phase — so every writer, and a
+// resume that skips the docs stage but still writes specs, shows the SAME SL-/FEAT- ids.
+//   - sliceIdByKey: slice key -> SL-<NNNN> (build number)
+//   - renderDeps:   a dependsOn list of raw slice KEYS -> their Slice IDs. A dep to a
+//     merged-away or intentionally-omitted key cannot occur (rewriteEdges remaps merges;
+//     topo order keeps prerequisites) but falls back to `<key> [omitted]` defensively.
+//   - featureRef:   a slice's parent feature key -> "FEAT-<NN> <name>" (blank-safe).
+// ---------------------------------------------------------------------------
+const sliceIdByKey = new Map(ordered.map(s => [s.id, sliceId(s.n)]))
+const renderDeps = (deps) => (deps || []).map(k => sliceIdByKey.get(k) || `${k} [omitted]`)
+const featureNumByKey = new Map(features.map((f, i) => [f.id, i + 1]))
+const featById = new Map(features.map(f => [f.id, f]))
+const featureRef = (key) => {
+  const n = featureNumByKey.get(key)
+  const f = featById.get(key)
+  return n ? `${featureId(n)}${f ? ` ${f.name}` : ''}` : (key || '')
+}
+
 // ===========================================================================
 // Stage: Docs — author the system-wide doc family (INDEX, ACCEPTANCE, ARCHITECTURE,
 // PRD) from the checkpointed build order. Idempotent overwrites; skipped on a resume
@@ -1587,114 +1765,113 @@ if (RESUMING && stageDone(savedStage, 'docs')) {
   log('Skipping doc family (checkpointed).')
 } else {
   phase('Synthesize')
-  const epicTree = buildEpicTree(ordered)
+  const featureTree = buildFeatureTree(ordered)
 
-  // Compact per-feature briefs shared by the PRD / ARCHITECTURE / INDEX writers.
+  // Compact briefs shared by the PRD / ARCHITECTURE / INDEX writers, carrying the canonical
+  // DISPLAY ids (SL-/FEAT-) so the writers transcribe them and never see a raw key.
   const orderedBrief = ordered.map(s => ({
-  n: s.n, id: s.id, name: s.name, epicId: s.epicId, capability: s.capability,
-  behaviorSummary: s.behaviorSummary, dependsOn: s.dependsOn || [],
+  sliceId: sliceId(s.n), n: s.n, name: s.name, feature: featureRef(s.featureKey), summary: s.summary,
+  behaviorSummary: s.behaviorSummary, dependsOn: renderDeps(s.dependsOn),
 }))
+  const featuresBrief = features.map((f, i) => ({
+    featureId: featureId(i + 1), name: f.name, kind: f.kind,
+    summary: f.summary, entryPoints: f.entryPoints || [],
+  }))
 
-// INDEX writer — transcribes the JS-computed build order + capability tree into
+// INDEX writer — transcribes the JS-computed build order + feature tree into
 // INDEX.md (the orchestrator sandbox cannot write files; an agent must). The data
 // is AUTHORITATIVE: the agent must not reorder or invent.
 //
-// Each feature carries its EXACT `spec` path (specRelPath → specName, the same source
+// Each slice carries its EXACT `spec` path (specRelPath → specName, the same source
 // of truth sliceDocPath uses to WRITE the file). The agent MUST link that verbatim and
 // MUST NOT re-slugify the name: slug() truncates to 48 chars, so a recomputed link for a
 // long name silently disagreed with the truncated file on disk — every such link 404'd
-// even on a fully successful run. The capability tree is enriched with the same per-
-// feature {n,id,name,spec} so its links use the exact path too (not just build order).
+// even on a fully successful run. The feature tree is enriched with the same per-
+// slice {n,id,name,spec} so its links use the exact path too (not just build order).
 const byIdForIndex = new Map(ordered.map(s => [s.id, s]))
 const indexData = {
   buildOrder: ordered.map(s => ({
-    n: s.n, id: s.id, name: s.name, epicId: s.epicId, spec: specRelPath(s),
-    dependsOn: s.dependsOn || [], mergedFrom: s.mergedFrom || [],
+    sliceId: sliceId(s.n), n: s.n, name: s.name, feature: featureRef(s.featureKey), spec: specRelPath(s),
+    dependsOn: renderDeps(s.dependsOn), mergedFrom: (s.mergedFrom || []).map(k => sliceIdByKey.get(k) || k),
   })),
-  capabilityTree: epicTree.map(({ epicId, sliceIds }) => ({
-    epicId,
-    features: sliceIds.map(id => {
+  featureTree: featureTree.map(({ featureKey, sliceIds }) => ({
+    featureId: featureRef(featureKey),
+    slices: sliceIds.map(id => {
       const s = byIdForIndex.get(id)
-      return { n: s.n, id: s.id, name: s.name, spec: specRelPath(s) }
+      return { sliceId: sliceId(s.n), n: s.n, name: s.name, spec: specRelPath(s) }
     }),
   })),
 }
 await agent(
   `You are the PortKit INDEX writer. ${rewriteClause(`${OUT}/INDEX.md`)} Write \`${OUT}/INDEX.md\` — the recreation roadmap — from the data below. ` +
-  `The build order and capability→feature tree are AUTHORITATIVE (computed deterministically) — do NOT reorder, ` +
-  `renumber, or invent.\n\n` +
-  `CRITICAL — spec links: every feature object carries an exact \`spec\` field (e.g. \`specs/0001-....md\`). Use that ` +
+  `The build order and feature→slice tree are AUTHORITATIVE (computed deterministically) — do NOT reorder, ` +
+  `renumber, or invent, and transcribe every \`SL-\`/\`FEAT-\` id VERBATIM.\n\n` +
+  `CRITICAL — spec links: every slice object carries an exact \`spec\` field (e.g. \`specs/0001-....md\`). Use that ` +
   `string VERBATIM as the markdown link target. Do NOT construct, slugify, shorten, or otherwise alter a spec path ` +
   `yourself — the filenames are truncated and a hand-built link will not match the file on disk.\n\n` +
-  `Include:\n` +
-  `- A CAPABILITY→FEATURE tree: group by capability in the given order (use \`capabilityTree\`); show each feature as ` +
-  `\`#<n> <name>\` with its id and a link whose target is that feature's exact \`spec\` value.\n` +
-  `- The RECOMMENDED BUILD ORDER as a numbered list (#1 first), each entry with id, name, capability, and its ` +
-  `dependsOn ids.\n` +
-  `- Flag any feature whose mergedFrom is non-empty (it absorbed duplicate features).\n\n` +
+  `${HOUSE_STYLE}\n\n${INDEX_TEMPLATE}\n\n` +
   `DATA:\n${JSON.stringify(indexData, null, 2)}`,
   { phase: 'Synthesize', label: 'index' }
 )
 
 // ACCEPTANCE writer — the single surface that flags coverage gaps loudly (each
-// feature spec's acceptance criteria are drawn from here). Written from the
-// extracted behavior data of the SURVIVING (post-merge) features; agent invents nothing.
-// The surviving features (light) + the behavior side-cars to pull their acceptance
-// criteria from. Criteria live in the per-capability behavior side-cars (written at
+// slice spec's acceptance criteria are drawn from here). Written from the
+// extracted behavior data of the SURVIVING (post-merge) slices; agent invents nothing.
+// The surviving slices (light) + the behavior side-cars to pull their acceptance
+// criteria from. Criteria live in the per-feature behavior side-cars (written at
 // discovery), NOT in the checkpoint — the ACCEPTANCE writer reads them from disk.
-const survivors = ordered.map(s => ({ sliceId: s.id, name: s.name, epicId: s.epicId }))
-const behaviorFiles = [...new Set(ordered.map(s => s.epicId))].map(behaviorCarPath)
+// Each survivor carries its canonical Slice ID + Feature ref for the writer to transcribe, plus
+// the raw `sliceKey` it uses to look the slice up in the behavior side-cars.
+const survivors = ordered.map(s => ({ sliceId: sliceId(s.n), feature: featureRef(s.featureKey), name: s.name, sliceKey: s.id }))
+const behaviorFiles = [...new Set(ordered.map(s => s.featureKey))].map(behaviorCarPath)
 await agent(
-  `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria, ` +
-  `grouped by capability and mapped to feature id, each with its source test \`path:line\` refs.\n\n` +
-  `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceId", "coverage", ` +
+  `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria.\n\n` +
+  `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceKey", "coverage", ` +
   `"acceptanceCriteria", "testRefs" } ] }\`):\n${behaviorFiles.map(f => `- \`${f}\``).join('\n')}\n` +
-  `READ them and index by \`sliceId\`. For EACH surviving feature below, emit its criteria/testRefs/coverage from ` +
-  `that index; if a feature's entry (or its file) is missing, treat coverage as 'none'. Use ONLY what the ` +
-  `side-cars contain — do NOT invent criteria.\n\n` +
-  `At the TOP, add a COVERAGE SUMMARY table (feature → good/thin/none) and LOUDLY flag every feature whose coverage ` +
-  `is 'thin' or 'none' as a rebuild risk — never paper over missing coverage.\n\n` +
-  `SURVIVING FEATURES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
+  `READ them and index by \`sliceKey\`. For EACH surviving slice below, emit its criteria/testRefs/coverage from ` +
+  `that index (label it by its \`sliceId\`/\`feature\`, NOT the raw sliceKey); if a slice's entry (or its file) is ` +
+  `missing, treat coverage as 'none'. Use ONLY what the side-cars contain — do NOT invent criteria. Never paper ` +
+  `over missing coverage.\n\n` +
+  `${HOUSE_STYLE}\n\n${ACCEPTANCE_TEMPLATE}\n\n` +
+  `SURVIVING SLICES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
   { phase: 'Synthesize', label: 'acceptance' }
 )
 
 // ARCHITECTURE writer — the system/tech spec. Absorbs the old system-map + kernel
 // glossary + cross-cutting conventions into one doc a weak model reads once and
-// every feature spec references (instead of restating).
+// every slice spec references (instead of restating).
 await agent(
   `You are the PortKit ARCHITECTURE writer. ${rewriteClause(`${OUT}/ARCHITECTURE.md`)} Write \`${OUT}/ARCHITECTURE.md\` — the system/technical spec a weak ` +
-  `local model reads ONCE to understand how the pieces fit, then every feature spec references it.\n\n` +
-  `Sections (in order):\n` +
-  `- Tech stack & build/test: languages, build system, test framework(s), where tests live, dependency manifests.\n` +
-  `- Component/module inventory: the internal building blocks and their responsibilities.\n` +
-  `- Data model & domain vocabulary: the core types/entities and a naming glossary (shared names features rely on).\n` +
-  `- Data flows: for each capability, how a request/event moves through the components.\n` +
-  `- Cross-cutting concerns: auth, config, logging, error handling, concurrency — stated as RULES features obey.\n\n` +
-  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nCAPABILITIES:\n${JSON.stringify(epics, null, 2)}\n\n` +
-  `FEATURES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
+  `local model reads ONCE to understand how the pieces fit, then every slice spec references it.\n\n` +
+  `${HOUSE_STYLE}\n\n${ARCHITECTURE_TEMPLATE}\n\n` +
+  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
+  `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
   { phase: 'Synthesize', label: 'arch' }
 )
 
 // PRD writer — product requirements RECONSTRUCTED from observed behavior. Intent
 // fields (goals/non-goals/metrics/users) are inferred and MUST be tagged; the
-// functional requirements are grounded (one per capability, cited).
+// functional requirements are grounded (one per feature, cited).
 await agent(
   `You are the PortKit PRD writer. ${rewriteClause(`${OUT}/PRD.md`)} Write \`${OUT}/PRD.md\` — a Product Requirements Document RECONSTRUCTED from ` +
   `the observed behavior of the source (you are reverse-engineering; the source does not state its own intent).\n\n` +
-  `Sections (in order):\n` +
-  `- Overview / Problem: what the software does and the problem it appears to solve.\n` +
-  `- Goals: \`[INFERRED]\` — the outcomes the software seems built to achieve.\n` +
-  `- Non-goals: \`[INFERRED]\` — inferred from what it deliberately does NOT do.\n` +
-  `- Success metrics: \`[INFERRED]\` — never fabricate numbers; write \`[INFERRED] none observable\` if unclear.\n` +
-  `- Users / personas: \`[INFERRED]\` — who the observable interfaces serve.\n` +
-  `- Functional requirements: one grounded bullet per capability, each citing \`path:line\`.\n` +
-  `- Constraints & assumptions.\n\n` +
-  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nCAPABILITIES:\n${JSON.stringify(epics, null, 2)}\n\n` +
-  `FEATURES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
+  `${HOUSE_STYLE}\n\n${PRD_TEMPLATE}\n\n` +
+  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
+  `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
   { phase: 'Synthesize', label: 'prd' }
 )
+
+// GLOSSARY writer — the kit's canonical vocabulary, so the weaker rebuilder (and any human
+// reader) knows exactly what Feature / Slice / SL-NNNN / FEAT-NN / ADR mean. Content is fixed
+// (GLOSSARY_TEMPLATE); the agent only needs to write it to disk (the sandbox can't).
+await agent(
+  `You are the PortKit GLOSSARY writer. ${rewriteClause(`${OUT}/GLOSSARY.md`)} Write \`${OUT}/GLOSSARY.md\` — the kit's ` +
+  `canonical vocabulary that every other document uses.\n\n${HOUSE_STYLE}\n\n${GLOSSARY_TEMPLATE}\n\n` +
+  `Write exactly that content to \`${OUT}/GLOSSARY.md\` (do not add or drop terms). Return when written.`,
+  { phase: 'Synthesize', label: 'glossary' }
+)
   await saveStage('docs', {})
-  didWorkThisTurn = true // the doc family (4 agents) ran this turn
+  didWorkThisTurn = true // the doc family (5 agents: INDEX/ACCEPTANCE/ARCHITECTURE/PRD/GLOSSARY) ran this turn
 }
 // Phase ceiling: /portkit-synthesize stops here (after the doc family is authored).
 if (stopAfter('docs', UNTIL)) return pausedAfter('docs', { slicesDiscovered })
@@ -1717,8 +1894,9 @@ if (RESUMING && stageDone(savedStage, 'adrs')) {
   `protocol/serialization choice, module boundaries, and load-bearing dependency choices.\n\n` +
   `HARD RULES: include a decision ONLY if you can point to observable EVIDENCE (\`path:line\` anchors) that it was ` +
   `made — no evidence, no ADR. Return at most ${MAX_ADRS}, ordered by significance (most load-bearing first). Give ` +
-  `each a stable id and a decision-shaped title.\n\n` +
-  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nCAPABILITIES:\n${JSON.stringify(epics, null, 2)}\n\n` +
+  `each a stable id, a decision-shaped title, and a TERSE 2-4 word kebab-case \`handle\` for the filename ` +
+  `(e.g. "two-file-persistence", "write-acl-matrix", "optimistic-locking" — NOT the full title).\n\n` +
+  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES:\n${JSON.stringify(features, null, 2)}\n\n` +
   `${GROUND_RULE}\n\nReturn the decisions.`,
   { schema: ADRS, phase: 'ADRs', label: 'adr:discover' }
 )
@@ -1726,22 +1904,18 @@ if (RESUMING && stageDone(savedStage, 'adrs')) {
     MAX_ADRS, 'ADRs')
 if (decisions.length) {
   log(`Discovered ${decisions.length} architecturally significant decision(s).`)
-  await pooled(decisions.map((d, i) => () => agent(
-    `You are the PortKit ADR writer. Write ONE Architecture Decision Record in MADR format to ` +
-    `\`${OUT}/adr/${pad(i + 1)}-${slug(d.title)}.md\`.\n\n` +
-    `${rewriteClause(`${OUT}/adr/${pad(i + 1)}-${slug(d.title)}.md`)}\n\n` +
-    `Sections (in order):\n` +
-    `- Title: \`${d.title}\`.\n` +
-    `- Status: \`Reconstructed\` (this ADR is reverse-engineered, not an original decision record).\n` +
-    `- Context & problem statement: the observed situation the decision addresses — cite \`path:line\`.\n` +
-    `- Decision drivers.\n` +
-    `- Considered options: the chosen option (grounded) and plausible rejected alternatives (\`[INFERRED]\`).\n` +
-    `- Decision outcome: what the source actually does — cite the EVIDENCE.\n` +
-    `- Consequences.\n` +
-    `- Rationale / "why": \`[INFERRED]\` — the source rarely states why; do not present a guess as fact.\n\n` +
-    `DECISION DATA:\n${JSON.stringify(d, null, 2)}\nSource root: \`${SOURCE}\`.\n\n${GROUND_RULE}\n\n${INFER_RULE}`,
-    { phase: 'ADRs', label: `adr:write:${i + 1}` }
-  )))
+  await pooled(decisions.map((d, i) => () => {
+    const aid = adrId(i + 1)
+    const adrPath = `${OUT}/adr/${adrName(i + 1, d.handle || d.title)}`
+    return agent(
+      `You are the PortKit ADR writer. Write ONE Architecture Decision Record in MADR format to \`${adrPath}\`.\n\n` +
+      `${rewriteClause(adrPath)}\n\n` +
+      `${HOUSE_STYLE}\n\n${ADR_TEMPLATE}\n\n` +
+      `Fill the skeleton for this decision (ADR ID \`${aid}\`, title \`${d.title}\` — transcribe both VERBATIM into ` +
+      `the header):\nDECISION DATA:\n${JSON.stringify(d, null, 2)}\nSource root: \`${SOURCE}\`.\n\n${GROUND_RULE}\n\n${INFER_RULE}`,
+      { phase: 'ADRs', label: `adr:write:${i + 1}` }
+    )
+  }))
   } else {
     const note = 'No architecturally significant decisions with observable evidence were found; no ADRs written.'
     log(`ℹ️  ${note}`); dropped.push(note)
@@ -1756,7 +1930,7 @@ if (budgetYieldNow()) return yieldForBudget('adrs', { adrs: decisions.length })
 // ===========================================================================
 // Stage: Write specs + critic. Over-scale decision (computed once, then persisted
 // so a resume reuses it): if a single run's projected agent count would approach the
-// runtime ceiling, partition feature-spec writing into resumable passes.
+// runtime ceiling, partition slice-spec writing into resumable passes.
 // runWriteAndFinish advances the `written` checkpoint each pass and CLEARS the
 // checkpoint on completion.
 // ===========================================================================
@@ -1764,7 +1938,7 @@ if (budgetYieldNow()) return yieldForBudget('adrs', { adrs: decisions.length })
 // (projected agents near the ~1000 ceiling) and a TOKEN budget (chunk to fit a subscription
 // window). Either engages small/batched writes; a token budget additionally makes each pass small.
 const finalCounts = {
-  epics: epics.length, slicesDiscovered,
+  features: features.length, slicesDiscovered,
   // Present ONLY on a test-limited run so the partial kit is unmistakable.
   ...(slicesOmittedForTest > 0 ? { testLimited: true, slicesOmittedForTest } : {}),
 }
@@ -1775,16 +1949,16 @@ if (!(RESUMING && stageDone(savedStage, 'critiqued'))) {
     partitioned = checkpoint.partitioned || tokenBudgetSet()
   } else {
     const projected = projectAgents({
-      epicCount: epics.length, sliceCount: ordered.length,
+      featureCount: features.length, sliceCount: ordered.length,
       adrCount: decisions.length, maxAdrs: MAX_ADRS, gapfillRounds: MAX_GAPFILL_ROUNDS,
     })
     const overScale = projected > SAFE_BUDGET
     partitioned = overScale || tokenBudgetSet()
     if (overScale) {
-      const note = `Over-scale: projected ~${projected} agents exceeds the safe budget (${SAFE_BUDGET}); partitioning feature-spec writing into resumable passes. Nothing dropped.`
+      const note = `Over-scale: projected ~${projected} agents exceeds the safe budget (${SAFE_BUDGET}); partitioning slice-spec writing into resumable passes. Nothing dropped.`
       log(`⚖️  ${note}`); dropped.push(note)
     } else if (tokenBudgetSet()) {
-      const note = `Token budget in effect (~${effectiveTokenTotal()} tokens, reserve ${TOKEN_RESERVE}); writing feature specs in small resumable passes sized to the subscription window. Nothing dropped.`
+      const note = `Token budget in effect (~${effectiveTokenTotal()} tokens, reserve ${TOKEN_RESERVE}); writing slice specs in small resumable passes sized to the subscription window. Nothing dropped.`
       log(`💰 ${note}`); dropped.push(note)
     }
   }
@@ -1811,12 +1985,12 @@ if (RESUMING && stageDone(savedStage, 'critiqued')) {
   gaps = Array.isArray(checkpoint.gaps) ? checkpoint.gaps : []
   log(`Skipping critic (checkpointed): ${gaps.length} gap(s).`)
 } else {
-  // Tell the critic which omissions are INTENTIONAL (limitSlices trims specs, maxEpics drops
-  // capabilities) so its gap-fill loop never "repairs" a deliberate truncation into a
+  // Tell the critic which omissions are INTENTIONAL (limitSlices trims specs, maxFeatures drops
+  // features) so its gap-fill loop never "repairs" a deliberate truncation into a
   // claimed-complete kit. '' on a full run ⇒ the critic/gap-fix prompts are byte-identical to today.
   const scopeNote = omissionScopeNote({
     slicesOmittedForTest, limitSlices: LIMIT_SLICES,
-    epicsKept: epics.length, epicsTotal: epicsTotal ?? epics.length,
+    featuresKept: features.length, featuresTotal: featuresTotal ?? features.length,
   })
   gaps = await runCritic(scopeNote)
   await saveStage('critiqued', { gaps })
@@ -1839,9 +2013,9 @@ if (DISTILL) {
     log('Skipping distill (checkpointed).')
   } else {
     const docPaths = [
-      'ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md',
+      'ARCHITECTURE.md', 'PRD.md', 'INDEX.md', 'ACCEPTANCE.md', 'GLOSSARY.md',
       ...ordered.map(s => specRelPath(s)),
-      ...decisions.map((d, i) => `adr/${pad(i + 1)}-${slug(d.title)}.md`),
+      ...decisions.map((d, i) => `adr/${adrName(i + 1, d.handle || d.title)}`),
     ]
     distill = await runDistill(docPaths)
     await saveStage('distilled', { distill })

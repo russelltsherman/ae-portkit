@@ -1,22 +1,41 @@
 # portkit
 
 A Claude Code plugin that reverse-engineers a codebase into a **stack-neutral recreation kit** — a
-family of standard planning/design documents (PRD, architecture spec, per-feature specs, ADRs,
+family of standard planning/design documents (PRD, architecture spec, per-slice specs, ADRs,
 acceptance criteria) — so a *less capable downstream model* (e.g. a quantized local model under
 ollama/omlx) can recreate the software **from the documents alone**, without reading the original
 source.
 
 It produces **documents only**. It does not perform the recreation.
 
-## Why feature specs
+## Why slice specs
 
 The kit pairs a small number of system-wide documents (PRD, ARCHITECTURE, ADRs) with one
-**feature spec** per capability. Each feature spec is one behavior thread running top-to-bottom
+**slice spec** per feature. Each slice spec is one behavior thread running top-to-bottom
 through every layer it touches (entry → validation → rule → data → persistence → **its acceptance
 criteria**), self-contained and independently buildable/testable. Shared naming, types, and
-cross-cutting conventions live once in `ARCHITECTURE.md`, which every feature spec references instead
+cross-cutting conventions live once in `ARCHITECTURE.md`, which every slice spec references instead
 of restating. This is what lets a weak model build one verifiable piece at a time instead of holding
 the whole system in context.
+
+## Terminology
+
+The kit uses one word per concept, everywhere. Each generated kit also ships this as `GLOSSARY.md`.
+
+| Term | Meaning | Canonical id |
+|---|---|---|
+| **Feature** | A coarse, externally-observable area of the system (an endpoint group, CLI command, public API surface, event/job, UI flow). The grouping level. | `FEAT-NN` |
+| **Slice** | One fine vertical behavior thread within a feature — independently buildable & testable end-to-end. The unit a spec documents (one `specs/*.md` per slice, in build order). | `SL-NNNN` |
+| **ADR** | An Architecture Decision Record for one significant, evidence-backed decision. | `ADR-NNNN` |
+
+Canonical ids are **deterministic** (a slice's `SL-NNNN` is its build number; a feature's `FEAT-NN`
+is its order in the map) and JS-owned, so specs, `INDEX.md`, and ADRs never disagree on how a unit is
+named. Internally the engine still assigns each unit an opaque discovery **key** to wire the
+dependency graph — that key never appears in the output; only the canonical id does.
+
+> **Note (for maintainers):** earlier versions used `epic` (→ **Feature**) and `capability`
+> (→ **Feature**) internally and called a slice a "feature" in the output. The vocabulary was unified
+> to **Feature / Slice**; the `maxEpics` arg is still accepted as a legacy alias for `maxFeatures`.
 
 ## Usage
 
@@ -49,7 +68,7 @@ continues from:
 
 | Command | Stops after | Review |
 |---|---|---|
-| `/portkit-map` | Map | the capability inventory |
+| `/portkit-map` | Map | the feature inventory |
 | `/portkit-discover` | Discover | slices + behavior side-cars |
 | `/portkit-synthesize` | Synthesize | `INDEX` / `ACCEPTANCE` / `ARCHITECTURE` / `PRD` |
 | `/portkit-adrs` | ADRs | `adr/*.md` |
@@ -69,40 +88,45 @@ re-iterate a phase during development, use `--fresh` or a throwaway `--output` d
 |---|---|
 | `PRD.md` | Product requirements reconstructed from observed behavior (intent fields tagged `[INFERRED]`) |
 | `ARCHITECTURE.md` | Tech stack, component inventory, data model + domain vocabulary, data flows, cross-cutting concerns |
-| `INDEX.md` | Recreation roadmap: capability→feature tree **and recommended build order** |
+| `INDEX.md` | Recreation roadmap: feature→slice tree **and recommended build order** (`FEAT-NN` / `SL-NNNN`) |
 | `ACCEPTANCE.md` | Acceptance-criteria rollup + coverage-gap table |
-| `specs/<NNNN>-<feature>.md` | One self-contained, self-testing feature spec (exact behavior, I/O, edge cases, errors, acceptance criteria) |
-| `adr/<NNNN>-<decision>.md` | One MADR-style Architecture Decision Record per significant decision (status `Reconstructed`) |
+| `GLOSSARY.md` | The kit's canonical vocabulary (Feature, Slice, `SL-NNNN`, `FEAT-NN`, ADR, …) |
+| `specs/<NNNN>-<slice>.md` | One self-contained, self-testing slice spec, opening with a metadata header (`Slice ID SL-NNNN`, Build #, parent `Feature FEAT-NN`, Depends on) then a fixed section skeleton (exact behavior, I/O, edge cases, errors, acceptance criteria) |
+| `adr/<NNNN>-<decision>.md` | One MADR-style Architecture Decision Record per significant decision (id `ADR-NNNN`, status `Reconstructed`) |
 | `RISKS-AND-GAPS.md` | Unverified claims, thin coverage, `[INFERRED]` misuse, open questions |
+
+Every document is written to a single **house style** with a fixed section skeleton and canonical
+identifiers, so the whole kit reads as one author produced it. See [Terminology](#terminology).
 
 ## How it works
 
 A single dynamic Workflow (`workflows/portkit.js`) runs these phases, fanning out fresh-context
 specialist agents:
 
-1. **Map** — survey the repo, draft the capability inventory (data only; no file written).
-2. **Discover slices** — per capability, trace each behavior end-to-end into fine features, then
+1. **Map** — survey the repo, draft the feature inventory (data only; no file written).
+2. **Discover slices** — per feature, trace each behavior end-to-end into fine slices, then
    extract the behavioral acceptance spec from the existing tests.
-3. **Synthesize** — normalize/dedup overlapping features, compute the topological build order, and
-   author the system-wide docs (PRD, ARCHITECTURE, INDEX, ACCEPTANCE).
+3. **Synthesize** — normalize/dedup overlapping slices, compute the topological build order, and
+   author the system-wide docs (PRD, ARCHITECTURE, INDEX, ACCEPTANCE, GLOSSARY).
 4. **ADRs** — discover architecturally significant decisions (each with `path:line` evidence), write
    one MADR-style ADR each.
-5. **Write specs** — one self-contained, self-testing feature spec per unit.
+5. **Write specs** — one self-contained, self-testing slice spec per unit.
 6. **Critic** — grounding + completeness audit → `RISKS-AND-GAPS.md`, with a budget-bounded gap-fill
    loop.
 
 ### Tuning knobs (optional `args`)
 
-`inputDir` (default `.`), `outputDir` (default `<inputDir>_portkit`), `maxEpics` (40), `maxAdrs`
+`inputDir` (default `.`), `outputDir` (default `<inputDir>_portkit`), `maxFeatures` (40), `maxAdrs`
 (12), `maxGapfillRounds` (2), `maxConcurrency` (8), `checkpointEvery` (default `maxConcurrency` —
-capabilities analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
+features analyzed per discovery checkpoint), `maxAgents` (1000, the over-scale guard's per-run
 ceiling), `maxTokensPerRun` (0 = unlimited — a per-invocation token ceiling for subscription-window
 chunking, see below), `tokenReserve` (50000 — tokens held back for the finishing critic pass),
 `distill` (false — after the critic, emit a citation-free `distilled/` mirror for the weaker rebuilder;
 see below), `fresh` (ignore any checkpoint and reprocess), `resume` (demand an existing checkpoint;
 auto-resume is the normal path). (`sourcePath`/`outDir` are accepted as legacy aliases for
-`inputDir`/`outputDir`.) **Features are never capped** — they are the deliverable, so dropping them is
-never an option; genuine over-scale is handled by capability-partitioned resumable passes (see
+`inputDir`/`outputDir`, and `maxEpics` for `maxFeatures` — renamed when the vocabulary was unified to
+Feature/Slice.) **Features are never capped** — they are the deliverable, so dropping them is
+never an option; genuine over-scale is handled by feature-partitioned resumable passes (see
 below). The remaining caps exist because the Workflow runtime limits a run to ~1000 agents; anything
 capped is **logged and recorded in the result's `truncations`** — silent truncation would read as
 "complete" when it isn't.
@@ -110,22 +134,22 @@ capped is **logged and recorded in the result's `truncations`** — silent trunc
 ### Resumability: checkpoint every stage, resume anywhere
 
 PortKit persists a checkpoint to `<outputDir>/.portkit/ir.json` after **every stage** — map, each
-discovery batch (`checkpointEvery` capabilities), synthesis, the doc family, ADRs, and each
-feature-spec write pass. If a run is interrupted (crash, timeout, spend limit, API outage),
+discovery batch (`checkpointEvery` features), synthesis, the doc family, ADRs, and each
+slice-spec write pass. If a run is interrupted (crash, timeout, spend limit, API outage),
 **re-running the same command auto-resumes** from the last completed stage rather than reprocessing —
-the expensive per-capability discovery is preserved batch by batch, so a large project never starts
+the expensive per-feature discovery is preserved batch by batch, so a large project never starts
 over. The checkpoint is fingerprinted by `source`, so one for a different input dir is ignored (never
 a wrong-codebase resume), and it is deleted when the run completes. Pass `--fresh` to ignore an
 existing checkpoint.
 
 Two things stay stable across a resume so the kit remains coherent: the synthesized build order (and
-its `#NNNN` numbering) and the discovered ADR set are computed once and reloaded, so feature specs
+its `#NNNN` numbering) and the discovered ADR set are computed once and reloaded, so slice specs
 already written keep matching their numbers.
 
 **Over-scale** is the same machinery taken further: if a single run's projected agent count would
-approach the runtime's ~1000-agent ceiling, the analysis + doc family + ADRs run once and feature
-specs are written in **capability-batched passes**, returning `resumeRequired: true` until every
-feature is written. **No feature is ever dropped.**
+approach the runtime's ~1000-agent ceiling, the analysis + doc family + ADRs run once and slice
+specs are written in **feature-batched passes**, returning `resumeRequired: true` until every
+slice is written. **No slice is ever dropped.**
 
 **Token/subscription-window chunking** rides the same substrate for very large projects. Set
 `maxTokensPerRun` (or use a runtime `+Nk` directive — that takes precedence) and the run **voluntarily
@@ -137,7 +161,7 @@ wall hard-aborts it mid-agent (which wastes the in-flight agent's tokens). Re-ru
 ceiling is **per run**, not cumulative (each resume refills), and a progress guard ensures every turn
 completes **at least one unit of work** before pausing, so it can never no-progress-loop even if the
 window is smaller than a single phase. Token-budgeted write passes batch at **slice granularity**
-(≈`maxConcurrency` specs), so overshoot is bounded even inside one very large capability. With no
+(≈`maxConcurrency` specs), so overshoot is bounded even inside one very large feature. With no
 budget set, none of this engages — behavior is byte-identical.
 
 **Distill for the rebuilder (opt-in).** Every doc is grounded with `path:line` source citations — the
@@ -153,7 +177,7 @@ top-level cited kit for review. Each distilled doc self-checks for leftover cita
 
 **Fresh & scope safety.** A `fresh` run clears the old checkpoint and **overwrites** the prior kit's
 docs/specs (no half-old/half-new "Frankenstein"); and auto-resume **refuses** a checkpoint whose
-`maxEpics`/`limitSlices` differ from the current run (e.g. resuming a `limitSlices` smoke test with a
+`maxFeatures`/`limitSlices` differ from the current run (e.g. resuming a `limitSlices` smoke test with a
 full-run command) instead of silently continuing the smaller scope.
 
 ## Design constraints baked in

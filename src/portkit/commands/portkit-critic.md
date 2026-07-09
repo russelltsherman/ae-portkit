@@ -11,7 +11,7 @@ whether a weaker model could rebuild from the kit alone — unresolved citations
 `[INFERRED]` misuse, non-self-contained specs, dangling deps — writes `<output>/RISKS-AND-GAPS.md`, and
 runs a budget-bounded gap-fill loop (`maxGapfillRounds`, default 2).
 
-Requires the feature specs; advances the ladder to here if the checkpoint is earlier. See `/portkit`
+Requires the slice specs; advances the ladder to here if the checkpoint is earlier. See `/portkit`
 for knobs, `/portkit-map` for the phase list.
 
 At this point the **cited kit is complete** (PRD, ARCHITECTURE, INDEX, ACCEPTANCE, specs, ADRs, risks).

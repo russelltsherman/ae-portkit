@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildEpicTree', 'projectAgents', 'planEpicBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -147,7 +147,7 @@ test('topoSort: partial cycle keeps acyclic prefix then cyclic remainder', () =>
 })
 
 // --- rewriteEdges ------------------------------------------------------------
-const slE = (id, epicId, ...deps) => ({ id, epicId, dependsOn: deps })
+const slE = (id, featureKey, ...deps) => ({ id, featureKey, dependsOn: deps })
 
 test('rewriteEdges: simple merge removes merged-away slice + records provenance', () => {
   const { rewriteEdges } = loadDeterministic()
@@ -196,13 +196,13 @@ test('rewriteEdges: transitive 3-way merge collapses to one survivor', () => {
   assert.deepEqual(slices[0].mergedFrom.slice().sort(), ['B', 'C'])
 })
 
-// --- buildEpicTree -----------------------------------------------------------
-test('buildEpicTree: groups by epic preserving first-appearance order', () => {
-  const { buildEpicTree } = loadDeterministic()
-  const tree = buildEpicTree([slE('A', 'e1'), slE('B', 'e2'), slE('C', 'e1')])
+// --- buildFeatureTree -----------------------------------------------------------
+test('buildFeatureTree: groups by feature preserving first-appearance order', () => {
+  const { buildFeatureTree } = loadDeterministic()
+  const tree = buildFeatureTree([slE('A', 'e1'), slE('B', 'e2'), slE('C', 'e1')])
   assert.deepEqual(tree, [
-    { epicId: 'e1', sliceIds: ['A', 'C'] },
-    { epicId: 'e2', sliceIds: ['B'] },
+    { featureKey: 'e1', sliceIds: ['A', 'C'] },
+    { featureKey: 'e2', sliceIds: ['B'] },
   ])
 })
 
@@ -257,59 +257,59 @@ test('portkit.js does not silently truncate the slice list (limitSlices stays op
 // --- projectAgents -----------------------------------------------------------
 test('projectAgents: base run (no ADRs) sums the fan-out', () => {
   const { projectAgents } = loadDeterministic()
-  // fixed 9 + 2*epics + slices + 0 adrs + gapfill
-  assert.equal(projectAgents({ epicCount: 4, sliceCount: 20, gapfillRounds: 2 }), 9 + 8 + 20 + 0 + 2)
+  // fixed 9 + 2*features + slices + 0 adrs + gapfill
+  assert.equal(projectAgents({ featureCount: 4, sliceCount: 20, gapfillRounds: 2 }), 9 + 8 + 20 + 0 + 2)
 })
 
 test('projectAgents: ADR fan-out adds min(adrCount, maxAdrs)', () => {
   const { projectAgents } = loadDeterministic()
   // adrCount 30 exceeds maxAdrs 12 -> only 12 ADR writers counted
-  assert.equal(projectAgents({ epicCount: 10, sliceCount: 200, adrCount: 30, maxAdrs: 12, gapfillRounds: 2 }),
+  assert.equal(projectAgents({ featureCount: 10, sliceCount: 200, adrCount: 30, maxAdrs: 12, gapfillRounds: 2 }),
     9 + 20 + 200 + 12 + 2)
 })
 
 test('projectAgents: ADR term is bounded by maxAdrs (fewer ADRs than the cap)', () => {
   const { projectAgents } = loadDeterministic()
   // adrCount 3 is under the cap -> exactly 3 ADR writers counted
-  assert.equal(projectAgents({ epicCount: 0, sliceCount: 0, adrCount: 3, maxAdrs: 12 }), 9 + 0 + 0 + 3 + 0)
+  assert.equal(projectAgents({ featureCount: 0, sliceCount: 0, adrCount: 3, maxAdrs: 12 }), 9 + 0 + 0 + 3 + 0)
 })
 
-test('projectAgents: grows ~1 per feature (write phase dominates)', () => {
+test('projectAgents: grows ~1 per slice (write phase dominates)', () => {
   const { projectAgents } = loadDeterministic()
-  const base = projectAgents({ epicCount: 5, sliceCount: 100 })
-  const more = projectAgents({ epicCount: 5, sliceCount: 101 })
+  const base = projectAgents({ featureCount: 5, sliceCount: 100 })
+  const more = projectAgents({ featureCount: 5, sliceCount: 101 })
   assert.equal(more - base, 1)
 })
 
-// --- planEpicBatches ---------------------------------------------------------
-const epic = (epicId, n) => ({ epicId, sliceIds: Array.from({ length: n }, (_, i) => `${epicId}.${i}`) })
+// --- planFeatureBatches ---------------------------------------------------------
+const feature = (featureKey, n) => ({ featureKey, sliceIds: Array.from({ length: n }, (_, i) => `${featureKey}.${i}`) })
 
-test('planEpicBatches: fits whole epics under budget into one batch', () => {
-  const { planEpicBatches } = loadDeterministic()
-  const batches = planEpicBatches([epic('a', 2), epic('b', 3)], 10)
+test('planFeatureBatches: fits whole features under budget into one batch', () => {
+  const { planFeatureBatches } = loadDeterministic()
+  const batches = planFeatureBatches([feature('a', 2), feature('b', 3)], 10)
   assert.equal(batches.length, 1)
-  assert.deepEqual(batches[0].epicIds, ['a', 'b'])
+  assert.deepEqual(batches[0].featureKeys, ['a', 'b'])
   assert.equal(batches[0].sliceIds.length, 5)
 })
 
-test('planEpicBatches: starts a new batch when the next epic would exceed budget', () => {
-  const { planEpicBatches } = loadDeterministic()
-  const batches = planEpicBatches([epic('a', 3), epic('b', 3), epic('c', 3)], 5)
-  assert.deepEqual(batches.map(b => b.epicIds), [['a'], ['b'], ['c']]) // 3+3>5 each time
+test('planFeatureBatches: starts a new batch when the next feature would exceed budget', () => {
+  const { planFeatureBatches } = loadDeterministic()
+  const batches = planFeatureBatches([feature('a', 3), feature('b', 3), feature('c', 3)], 5)
+  assert.deepEqual(batches.map(b => b.featureKeys), [['a'], ['b'], ['c']]) // 3+3>5 each time
 })
 
-test('planEpicBatches: never splits an epic; oversized epic is its own batch', () => {
-  const { planEpicBatches } = loadDeterministic()
-  const batches = planEpicBatches([epic('big', 12), epic('small', 2)], 5)
-  assert.equal(batches[0].epicIds.length, 1)
+test('planFeatureBatches: never splits an feature; oversized feature is its own batch', () => {
+  const { planFeatureBatches } = loadDeterministic()
+  const batches = planFeatureBatches([feature('big', 12), feature('small', 2)], 5)
+  assert.equal(batches[0].featureKeys.length, 1)
   assert.equal(batches[0].sliceIds.length, 12) // not split despite > budget
-  assert.deepEqual(batches[1].epicIds, ['small'])
+  assert.deepEqual(batches[1].featureKeys, ['small'])
 })
 
-test('planEpicBatches: partitions cover every slice exactly once (no drops)', () => {
-  const { planEpicBatches } = loadDeterministic()
-  const tree = [epic('a', 4), epic('b', 4), epic('c', 4), epic('d', 4)]
-  const batches = planEpicBatches(tree, 6)
+test('planFeatureBatches: partitions cover every slice exactly once (no drops)', () => {
+  const { planFeatureBatches } = loadDeterministic()
+  const tree = [feature('a', 4), feature('b', 4), feature('c', 4), feature('d', 4)]
+  const batches = planFeatureBatches(tree, 6)
   const all = batches.flatMap(b => b.sliceIds)
   assert.equal(all.length, 16)
   assert.equal(new Set(all).size, 16) // every slice present once
@@ -368,6 +368,12 @@ test('parseArgs: --flag=value form', () => {
 test('parseArgs: unknown tuning knobs pass through (camelCase preserved)', () => {
   const { parseArgs } = loadDeterministic()
   assert.equal(parseArgs('--input /m --maxAdrs 20').maxAdrs, '20')
+})
+
+test('parseArgs: legacy --maxEpics aliases to maxFeatures (epic→feature rename compat)', () => {
+  const { parseArgs } = loadDeterministic()
+  assert.equal(parseArgs('--input /m --maxEpics 5').maxFeatures, '5')
+  assert.equal(parseArgs('--maxEpics=7').maxFeatures, '7')
 })
 
 test('parseArgs: empty / missing / non-string-non-object -> {}', () => {
@@ -508,7 +514,7 @@ test('chunk: covers every item exactly once (no drops)', () => {
 // --- slug / pad / specName (spec filename = INDEX link, single source of truth) ---
 // Regression guard for the dangling-INDEX-link bug: spec FILES are named with a
 // 48-char-truncated slug, but the INDEX writer used to recompute an UNtruncated slug
-// for its links, so any feature name longer than 48 chars produced a link that 404'd
+// for its links, so any slice name longer than 48 chars produced a link that 404'd
 // against the file on disk — even on a fully successful run. Both sides now derive from
 // specName(), so these tests pin that the filename is stable and truncated.
 
@@ -532,24 +538,91 @@ test('pad: zero-pads a build number to 4 digits', () => {
   assert.equal(pad(1234), '1234')
 })
 
-test('specName: <NNNN>-<slug>.md with the slug truncated to 48 chars', () => {
-  const { specName, slug, pad } = loadDeterministic()
-  // The exact case observed on disk that dangled: a >48-char name is truncated.
-  const name = 'Default config schema and DEFAULT_CONFIG constant'
-  const got = specName(1, name)
-  assert.equal(got, '0001-default-config-schema-and-default-config-constan.md')
-  // It is exactly pad + '-' + capped slug + '.md' (the file writer's construction).
-  assert.equal(got, `${pad(1)}-${slug(name)}.md`)
-  // And the name part is capped: a re-slugified FULL name (the old buggy INDEX link)
-  // would NOT match — which is precisely why the link must reuse specName, not rebuild.
-  const untruncated = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-  assert.notEqual(`0001-${untruncated}.md`, got)
+test('specName: <SliceID>-<slug>.md, id-prefixed + slug truncated to 48 chars', () => {
+  const { specName, slug, sliceId } = loadDeterministic()
+  // Normal case: a terse handle produces a clean, short, self-identifying filename.
+  assert.equal(specName(1, 'init-dispatch'), 'SL-0001-init-dispatch.md')
+  // A long label is still capped (regression guard for the dangling-INDEX-link bug: both
+  // the file writer and the INDEX link derive from specName, so they can't disagree).
+  const label = 'Default config schema and DEFAULT_CONFIG constant'
+  const got = specName(1, label)
+  assert.equal(got, `${sliceId(1)}-${slug(label)}.md`)
+  assert.ok(got.startsWith('SL-0001-'), 'filename carries the canonical Slice ID')
+  const untruncated = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  assert.notEqual(`${sliceId(1)}-${untruncated}.md`, got)
 })
 
-test('specName: short names are not truncated (round-trip stable)', () => {
-  const { specName } = loadDeterministic()
-  assert.equal(specName(3, 'outputJson helper structured success envelope'),
-    '0003-outputjson-helper-structured-success-envelope.md')
+test('adrName: <ADR-ID>-<slug>.md, id-prefixed single source of truth', () => {
+  const { adrName, slug, adrId } = loadDeterministic()
+  assert.equal(adrName(1, 'two-file-persistence'), 'ADR-0001-two-file-persistence.md')
+  assert.equal(adrName(5, 'write-acl-matrix'), 'ADR-0005-write-acl-matrix.md')
+  assert.equal(adrName(5, 'write-acl-matrix'), `${adrId(5)}-${slug('write-acl-matrix')}.md`)
+})
+
+// --- canonical DISPLAY ids (SL-/FEAT-/ADR-) — deterministic, user-facing, tested like specName ---
+test('sliceId: SL-<NNNN> zero-padded to 4 digits, composes with pad', () => {
+  const { sliceId, pad } = loadDeterministic()
+  assert.equal(sliceId(1), 'SL-0001')
+  assert.equal(sliceId(42), 'SL-0042')
+  assert.equal(sliceId(1234), 'SL-1234')
+  assert.equal(sliceId(7), `SL-${pad(7)}`)
+})
+
+test('featureId: FEAT-<NN> zero-padded to 2 digits, overflows to 3 past 99', () => {
+  const { featureId } = loadDeterministic()
+  assert.equal(featureId(1), 'FEAT-01')
+  assert.equal(featureId(9), 'FEAT-09')
+  assert.equal(featureId(10), 'FEAT-10')
+  assert.equal(featureId(100), 'FEAT-100') // documented overflow: never truncates
+})
+
+test('adrId: ADR-<NNNN> zero-padded to 4 digits, composes with pad', () => {
+  const { adrId, pad } = loadDeterministic()
+  assert.equal(adrId(1), 'ADR-0001')
+  assert.equal(adrId(12), 'ADR-0012')
+  assert.equal(adrId(12), `ADR-${pad(12)}`)
+})
+
+// --- house style + document templates (source-grep: they live OUTSIDE the fence, so
+// loadDeterministic() can't see them — assert on the file text, like existing source guards).
+// These pin the single-source-of-truth document skeletons that kill per-writer variance.
+const FULL_SRC = readFileSync(SRC, 'utf8')
+
+test('HOUSE_STYLE: names the canonical id prefixes and BANS the old vocabulary', () => {
+  assert.match(FULL_SRC, /const HOUSE_STYLE\s*=/, 'HOUSE_STYLE constant is defined')
+  for (const prefix of ['SL-NNNN', 'FEAT-NN', 'ADR-NNNN']) {
+    assert.ok(FULL_SRC.includes(prefix), `HOUSE_STYLE-era text references ${prefix}`)
+  }
+  // the ban list must literally name the retired words so writers never emit them
+  assert.match(FULL_SRC, /"epic", "capability", or "vertical thread"/, 'HOUSE_STYLE forbids epic/capability/vertical thread')
+})
+
+test('SLICE_SPEC_TEMPLATE: exact metadata header + section headings, single source of truth', () => {
+  assert.match(FULL_SRC, /const SLICE_SPEC_TEMPLATE\s*=/, 'SLICE_SPEC_TEMPLATE is defined')
+  for (const label of ['**Slice ID:**', '**Build #:**', '**Feature:**', '**Status:**', '**Depends on:**']) {
+    assert.ok(FULL_SRC.includes(label), `slice spec metadata header has ${label}`)
+  }
+  for (const h of ['## Summary', '## Behavior Thread', '## Interface & Contract',
+    '## Acceptance Criteria', '## Build Steps', '## Shared Conventions']) {
+    assert.ok(FULL_SRC.includes(h), `slice spec skeleton has heading ${h}`)
+  }
+})
+
+test('doc-family templates are all defined with their signature headings', () => {
+  for (const name of ['ARCHITECTURE_TEMPLATE', 'PRD_TEMPLATE', 'ADR_TEMPLATE',
+    'INDEX_TEMPLATE', 'ACCEPTANCE_TEMPLATE', 'GLOSSARY_TEMPLATE']) {
+    assert.match(FULL_SRC, new RegExp(`const ${name}\\s*=`), `${name} is defined`)
+  }
+  assert.ok(FULL_SRC.includes('## Tech Stack & Build/Test'), 'ARCHITECTURE heading present')
+  assert.ok(FULL_SRC.includes('## Functional Requirements'), 'PRD heading present')
+  assert.ok(FULL_SRC.includes('**ADR ID:**'), 'ADR metadata present')
+  assert.ok(FULL_SRC.includes('## Recommended Build Order'), 'INDEX heading present')
+  assert.ok(FULL_SRC.includes('## Coverage Summary'), 'ACCEPTANCE heading present')
+})
+
+test('regression: the old free-form "Include, in this order" checklist is gone', () => {
+  assert.ok(!FULL_SRC.includes('Include, in this order:'),
+    'writers must fill the rigid skeleton, not a free-form content checklist')
 })
 
 // --- budgetExhausted (token/subscription-window voluntary-yield decision) ---
@@ -622,7 +695,7 @@ test('findSourceCitations: none in already-clean prose', () => {
 // ALONE triggers a behavior-only re-run, not re-discovery.
 const ep = (id) => ({ id })
 
-test('planResume: light-only capabilities are RELOADED, never re-discovered', () => {
+test('planResume: light-only features are RELOADED, never re-discovered', () => {
   const { planResume } = loadDeterministic()
   const scan = [{ id: 'a', hasLight: true, hasBehavior: true }, { id: 'b', hasLight: true, hasBehavior: true }]
   const plan = planResume([ep('a'), ep('b')], scan)
@@ -633,7 +706,7 @@ test('planResume: light-only capabilities are RELOADED, never re-discovered', ()
 
 test('planResume: REGRESSION — missing behavior side-car re-runs behavior only (no re-discovery/renumber)', () => {
   const { planResume } = loadDeterministic()
-  // The failure case: structure present, behavior agent had failed for 3 capabilities.
+  // The failure case: structure present, behavior agent had failed for 3 features.
   const scan = [
     { id: 'cli-init', hasLight: true, hasBehavior: true },
     { id: 'cli-edit', hasLight: true, hasBehavior: false },
@@ -641,7 +714,7 @@ test('planResume: REGRESSION — missing behavior side-car re-runs behavior only
     { id: 'cli-setup', hasLight: true, hasBehavior: false },
   ]
   const plan = planResume([ep('cli-init'), ep('cli-edit'), ep('cli-query'), ep('cli-setup')], scan)
-  // Every capability's STRUCTURE is reloaded — so the slice set (and numbering) is invariant.
+  // Every feature's STRUCTURE is reloaded — so the slice set (and numbering) is invariant.
   assert.deepEqual(plan.reload, ['cli-init', 'cli-edit', 'cli-query', 'cli-setup'])
   // The three with a missing behavior spec re-run behavior ONLY.
   assert.deepEqual(plan.behaviorOnly, ['cli-edit', 'cli-query', 'cli-setup'])
@@ -649,7 +722,7 @@ test('planResume: REGRESSION — missing behavior side-car re-runs behavior only
   assert.deepEqual(plan.discover, [])
 })
 
-test('planResume: a capability with no light.json needs full discovery', () => {
+test('planResume: a feature with no light.json needs full discovery', () => {
   const { planResume } = loadDeterministic()
   const scan = [{ id: 'a', hasLight: true, hasBehavior: true }]
   const plan = planResume([ep('a'), ep('b')], scan) // b never analyzed
@@ -658,30 +731,30 @@ test('planResume: a capability with no light.json needs full discovery', () => {
   assert.deepEqual(plan.behaviorOnly, [])
 })
 
-test('planResume: preserves `epics` order (build numbering stays identical to a fresh run)', () => {
+test('planResume: preserves `features` order (build numbering stays identical to a fresh run)', () => {
   const { planResume } = loadDeterministic()
-  const scan = [ // deliberately scrambled vs. epics order
+  const scan = [ // deliberately scrambled vs. features order
     { id: 'c', hasLight: true, hasBehavior: true },
     { id: 'a', hasLight: true, hasBehavior: false },
     { id: 'b', hasLight: true, hasBehavior: true },
   ]
   const plan = planResume([ep('a'), ep('b'), ep('c')], scan)
-  assert.deepEqual(plan.reload, ['a', 'b', 'c']) // epics order, NOT scan order
+  assert.deepEqual(plan.reload, ['a', 'b', 'c']) // features order, NOT scan order
 })
 
-test('planResume: every capability is classified exactly once (no drops, no double-count)', () => {
+test('planResume: every feature is classified exactly once (no drops, no double-count)', () => {
   const { planResume } = loadDeterministic()
   const scan = [
     { id: 'a', hasLight: true, hasBehavior: true },
     { id: 'b', hasLight: true, hasBehavior: false },
     // c absent from scan entirely
   ]
-  const epics = [ep('a'), ep('b'), ep('c')]
-  const plan = planResume(epics, scan)
+  const features = [ep('a'), ep('b'), ep('c')]
+  const plan = planResume(features, scan)
   // reload ∪ discover covers all; behaviorOnly ⊆ reload.
   assert.deepEqual([...plan.reload, ...plan.discover].sort(), ['a', 'b', 'c'])
   assert.ok(plan.behaviorOnly.every(id => plan.reload.includes(id)))
-  assert.equal(plan.reload.length + plan.discover.length, epics.length)
+  assert.equal(plan.reload.length + plan.discover.length, features.length)
 })
 
 test('planResume: empty / missing inputs are safe', () => {
@@ -695,38 +768,38 @@ test('planResume: empty / missing inputs are safe', () => {
 
 test('omissionScopeNote: no intentional omission -> empty string (full run prompts byte-identical)', () => {
   const { omissionScopeNote } = loadDeterministic()
-  assert.equal(omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, epicsKept: 3, epicsTotal: 3 }), '')
+  assert.equal(omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, featuresKept: 3, featuresTotal: 3 }), '')
   assert.equal(omissionScopeNote({}), '')
   assert.equal(omissionScopeNote(), '')
-  // epicsKept >= epicsTotal (no cap) and no slices omitted is also empty.
-  assert.equal(omissionScopeNote({ epicsKept: 5, epicsTotal: 3 }), '')
+  // featuresKept >= featuresTotal (no cap) and no slices omitted is also empty.
+  assert.equal(omissionScopeNote({ featuresKept: 5, featuresTotal: 3 }), '')
 })
 
 test('omissionScopeNote: limitSlices omission names the count + the do-NOT-backfill directives', () => {
   const { omissionScopeNote } = loadDeterministic()
-  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, epicsKept: 2, epicsTotal: 2 })
+  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, featuresKept: 2, featuresTotal: 2 })
   assert.match(note, /INTENTIONAL TEST-SCOPE/)
-  assert.match(note, /7 feature spec\(s\) were INTENTIONALLY omitted/)
+  assert.match(note, /7 slice spec\(s\) were INTENTIONALLY omitted/)
   assert.match(note, /limitSlices=3/)
   assert.match(note, /do NOT .*regenerate|back-fill/i)
-  // it must NOT mention a maxEpics cap when none happened
-  assert.ok(!/capability\(ies\) were INTENTIONALLY dropped/.test(note))
+  // it must NOT mention a maxFeatures cap when none happened
+  assert.ok(!/feature\(ies\) were INTENTIONALLY dropped/.test(note))
 })
 
-test('omissionScopeNote: maxEpics cap names kept-of-total', () => {
+test('omissionScopeNote: maxFeatures cap names kept-of-total', () => {
   const { omissionScopeNote } = loadDeterministic()
-  const note = omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, epicsKept: 2, epicsTotal: 4 })
+  const note = omissionScopeNote({ slicesOmittedForTest: 0, limitSlices: 0, featuresKept: 2, featuresTotal: 4 })
   assert.match(note, /INTENTIONAL TEST-SCOPE/)
-  assert.match(note, /2 capability\(ies\) were INTENTIONALLY dropped/)
+  assert.match(note, /2 feature\(ies\) were INTENTIONALLY dropped/)
   assert.match(note, /2 of 4/)
-  assert.ok(!/feature spec\(s\) were INTENTIONALLY omitted/.test(note))
+  assert.ok(!/slice spec\(s\) were INTENTIONALLY omitted/.test(note))
 })
 
 test('omissionScopeNote: both arms fire together', () => {
   const { omissionScopeNote } = loadDeterministic()
-  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, epicsKept: 2, epicsTotal: 4 })
-  assert.match(note, /7 feature spec\(s\) were INTENTIONALLY omitted/)
-  assert.match(note, /2 capability\(ies\) were INTENTIONALLY dropped/)
+  const note = omissionScopeNote({ slicesOmittedForTest: 7, limitSlices: 3, featuresKept: 2, featuresTotal: 4 })
+  assert.match(note, /7 slice spec\(s\) were INTENTIONALLY omitted/)
+  assert.match(note, /2 feature\(ies\) were INTENTIONALLY dropped/)
 })
 
 // Full-file syntax gate. portkit.js has top-level `return`/`await`, legal only
