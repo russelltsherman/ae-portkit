@@ -10,7 +10,7 @@ export const meta = {
     { title: 'ADRs', detail: 'discover architecturally significant decisions; write one MADR-style ADR each' },
     { title: 'Write specs', detail: 'one self-contained, self-testing slice spec per unit' },
     { title: 'Critic', detail: 'grounding + completeness pass; write RISKS-AND-GAPS.md' },
-    { title: 'Distill', detail: 'opt-in: emit a citation-free distilled/ mirror for the weaker rebuilder' },
+    { title: 'Distill', detail: 'emit a citation-free distilled/ mirror for the weaker rebuilder (default on)' },
   ],
 }
 
@@ -76,12 +76,14 @@ const LIMIT_SLICES = Math.max(0, Math.floor(Number(cfg.limitSlices) || 0))
 // normally SKIP an existing non-empty output (so a resume never re-authors it); on a fresh run they
 // must OVERWRITE instead, otherwise a re-run over a prior (e.g. smaller/aborted) kit keeps the stale
 // docs and yields a Frankenstein. rewriteClause injects the right instruction into each writer.
-// DISTILL (opt-in): after the critic validates the kit, emit a CLEAN mirror under <OUT>/distilled/
-// with the verified `path:line` source citations stripped — the receipts help the generator/critic
-// and a human auditor, but a weaker rebuilder cannot open them and is only confused (or led to
-// hallucinate) by them. `[INFERRED]`/`[UNVERIFIED]` flags and artifact paths (no line number) are
-// kept. The cited originals stay at the top level as the grounding/audit copy.
-const DISTILL = !!cfg.distill
+// DISTILL (ON by default; opt out with `distill: false`): after the critic validates the kit, emit
+// a CLEAN mirror under <OUT>/distilled/ with the verified `path:line` source citations stripped —
+// the receipts help the generator/critic and a human auditor, but a weaker rebuilder cannot open
+// them and is only confused (or led to hallucinate) by them. `[INFERRED]`/`[UNVERIFIED]` flags and
+// artifact paths (no line number) are kept. The cited originals stay at the top level as the
+// grounding/audit copy. The distilled/ mirror IS the artifact the weaker downstream model rebuilds
+// from, so a complete run produces it by default; `distill: false` yields the cited kit only.
+const DISTILL = cfg.distill !== false
 
 // Phase ceiling (per-phase commands: /portkit-map, /portkit-adrs, …). When set to a
 // ladder stage name, the run advances to that stage, persists the checkpoint, and
@@ -448,7 +450,7 @@ function planFeatureBatches(featureTree, perBatch) {
 // the IR as `stage`. A resume skips every stage whose work is already done. The
 // intermediate 'discovering' marks a PARTIALLY complete discovery phase (some
 // features analyzed, more to go), so it sits between 'mapped' and 'discovered'.
-// 'critiqued' and 'distilled' are the terminal stages (Critic + the opt-in Distill
+// 'critiqued' and 'distilled' are the terminal stages (Critic + the default-on Distill
 // mirror), promoted to first-class ladder stages so the per-phase commands can stop
 // after each. stageList() is the single source of truth for the order; stageIndex()
 // and stageAfter() both derive from it (keeping the array in one place).
@@ -1235,6 +1237,25 @@ function docsIncomplete(missing) {
   }
 }
 
+// adrsIncomplete — same guard as docsIncomplete, for the ADR stage: ≥1 ADR file is still absent
+// after an in-run retry (a writer agent kept dying). Do NOT checkpoint 'adrs' (a resume would skip
+// ADR writing and never regenerate the missing record) and do NOT finalize. Stop with the
+// checkpoint kept at 'docs'; a re-run re-discovers + re-authors the ADRs. resumeRequired:false —
+// already retried in-run, so no auto-loop; a human sees the named missing ADR and re-runs.
+function adrsIncomplete(missing) {
+  const err = `ADRs INCOMPLETE: ${missing.length} record(s) still missing after a retry — ${missing.join(', ')}. ` +
+    `The 'adrs' stage was NOT checkpointed and \`${IR_PATH}\` was KEPT; re-run with { resume: true } pointed at ` +
+    `outputDir "${OUT}" to re-author the ADR(s).`
+  log(`⛔ ${err}`); dropped.push(err)
+  return {
+    ok: false, outDir: OUT, resumeRequired: false, stage: 'adrs',
+    error: err, missingAdrs: missing,
+    resumeArgs: { resume: true, outputDir: OUT },
+    counts: {},
+    truncations: dropped,
+  }
+}
+
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
@@ -1406,7 +1427,7 @@ async function runCritic(scopeNote = '') {
   return gaps
 }
 
-// Distill (opt-in): emit a citation-free MIRROR of the kit under <OUT>/distilled/ for the weaker
+// Distill (default-on): emit a citation-free MIRROR of the kit under <OUT>/distilled/ for the weaker
 // rebuilder. `docPaths` are relative to OUT (ARCHITECTURE.md, PRD.md, INDEX.md, ACCEPTANCE.md, every
 // specs/*.md and adr/*.md). Each doc is stripped by its own agent (file-to-file, so large docs never
 // round-trip through the orchestrator), then self-checks for residual `path:line` refs. Returns the
@@ -1489,19 +1510,21 @@ async function clearIR() {
     { phase: 'Checkpoint', label: 'ir:clear' }
   )
 }
-// missingDocs — VERIFY which of the doc-family files actually exist (and are non-empty) on disk.
-// The orchestrator sandbox can't stat files, so an agent lists them (like scanFeatureSidecars).
-// Used to GATE the 'docs' checkpoint: a dead writer agent leaves its file absent, and we must not
-// record the stage done over a missing document. Fail-SAFE: if the verify agent itself dies, treat
-// ALL files as missing (→ retry/pause) rather than falsely reporting the doc family complete.
-async function missingDocs(files) {
+// missingDocs — VERIFY which of the listed files actually exist (and are non-empty) on disk. The
+// orchestrator sandbox can't stat files, so an agent lists them (like scanFeatureSidecars). Used to
+// GATE a stage's checkpoint (doc family AND ADRs): a dead writer agent leaves its file absent, and
+// we must not record the stage done over a missing artifact. `files` are paths RELATIVE to OUT
+// (e.g. "PRD.md" or "adr/ADR-0001-x.md"), so it works for both flat docs and the adr/ subdir. The
+// agent echoes back the missing paths VERBATIM. Fail-SAFE: if the verify agent itself dies, treat
+// ALL files as missing (→ retry/pause) rather than falsely reporting the stage complete.
+async function missingDocs(files, { label = 'docs:verify', phase = 'Synthesize' } = {}) {
   const r = await agent(
-    `You are the PortKit DOC-VERIFY agent. For EACH file below, check whether it EXISTS under \`${OUT}\` and is ` +
-    `NON-EMPTY:\n${files.map(f => `- \`${OUT}/${f}\``).join('\n')}\n\n` +
-    `Return \`{"missing": [ <the basenames that are ABSENT or EMPTY> ]}\` — basenames only (e.g. "PRD.md"); ` +
-    `an empty array means every file is present.`,
+    `You are the PortKit DOC-VERIFY agent. For EACH path below (relative to \`${OUT}\`), check whether the file ` +
+    `EXISTS under \`${OUT}\` and is NON-EMPTY:\n${files.map(f => `- \`${f}\``).join('\n')}\n\n` +
+    `Return \`{"missing": [ <the paths, EXACTLY as listed above, that are ABSENT or EMPTY> ]}\` — copy each path ` +
+    `verbatim from the list; an empty array means every listed file is present.`,
     { schema: { type: 'object', properties: { missing: { type: 'array', items: { type: 'string' } } }, required: ['missing'] },
-      phase: 'Synthesize', label: 'docs:verify' }
+      phase, label }
   )
   const want = new Set(files)
   if (!r || !Array.isArray(r.missing)) return [...files] // verify died ⇒ assume all missing (fail-safe)
@@ -1658,10 +1681,23 @@ async function runWriteSpecs({ ordered, partitioned, priorWritten = [], extraCou
 // distill stages produce the same result (gaps/distill come from the checkpoint on such
 // a resume). clearIR() lives ONLY here — a phase command that stops early returns
 // pausedAfter() and deliberately leaves the checkpoint intact for the next phase.
-async function finalize({ ordered, adrs = [], gaps = [], distill = null, extraCounts = {} }) {
-  await clearIR()
+async function finalize({ ordered, adrs = [], gaps = [], distill = null, extraCounts = {}, cleared = true }) {
+  // The checkpoint is DESTROYED only when EVERY ladder stage completed. Distillation is the terminal
+  // stage; opting out (`distill: false`) means it never ran, so the run is not fully complete and we
+  // KEEP the checkpoint (cleared=false). The cited kit is done, but a later `/portkit-distill` (or a
+  // re-run without `distill: false`) can resume from 'critiqued' to add the rebuilder mirror WITHOUT
+  // re-running the analysis. Only a run that reached 'distilled' clears.
+  if (cleared) {
+    await clearIR()
+  } else {
+    log(`ℹ️  Distillation opted out — the cited kit is complete, but the checkpoint at \`${IR_PATH}\` is ` +
+      `KEPT (the terminal 'distilled' stage never ran). Run \`/portkit-distill\` (or re-run without ` +
+      `\`distill: false\`) to add the citation-free \`distilled/\` mirror and finalize; use --fresh or ` +
+      `delete \`.portkit/\` to discard it.`)
+  }
   return {
     ok: true, outDir: OUT, resumeRequired: false,
+    ...(cleared ? {} : { checkpointRetained: true, distillAvailable: true }),
     counts: {
       slicesPlanned: ordered.length,
       slicesWritten: ordered.length,
@@ -2134,18 +2170,33 @@ if (RESUMING && stageDone(savedStage, 'adrs')) {
     MAX_ADRS, 'ADRs')
 if (decisions.length) {
   log(`Discovered ${decisions.length} architecturally significant decision(s).`)
-  await pooled(decisions.map((d, i) => () => {
+  // Author each ADR as a RETRYABLE unit keyed by its output file, then VERIFY on disk — the same
+  // guard as the doc family. Before, the writer results were discarded and 'adrs' was checkpointed
+  // unconditionally, so a dead ADR writer left its file absent, the stage was recorded DONE, and a
+  // resume skipped ADR writing forever. Verify → retry the missing writers once → refuse to
+  // checkpoint 'adrs' if any ADR file is still absent (a re-run then re-authors them).
+  const adrWriters = decisions.map((d, i) => {
     const aid = adrId(i + 1)
-    const adrPath = `${OUT}/adr/${adrName(i + 1, d.handle || d.title)}`
-    return agent(
+    const rel = `adr/${adrName(i + 1, d.handle || d.title)}`
+    const adrPath = `${OUT}/${rel}`
+    return { file: rel, run: () => agent(
       `You are the PortKit ADR writer. Write ONE Architecture Decision Record in MADR format to \`${adrPath}\`.\n\n` +
       `${rewriteClause(adrPath)}\n\n` +
       `${HOUSE_STYLE}\n\n${ADR_TEMPLATE}\n\n` +
       `Fill the skeleton for this decision (ADR ID \`${aid}\`, title \`${d.title}\` — transcribe both VERBATIM into ` +
       `the header):\nDECISION DATA:\n${JSON.stringify(d, null, 2)}\nSource root: \`${SOURCE}\`.\n\n${GROUND_RULE}\n\n${INFER_RULE}`,
-      { phase: 'ADRs', label: `adr:write:${i + 1}` }
-    )
-  }))
+      { phase: 'ADRs', label: `adr:write:${i + 1}` }) }
+  })
+  const allAdrFiles = adrWriters.map(w => w.file)
+  await pooled(adrWriters.map(w => () => w.run()))
+  let missingAdrFiles = await missingDocs(allAdrFiles, { label: 'adrs:verify', phase: 'ADRs' })
+  if (missingAdrFiles.length) {
+    log(`⚠️  ADRs: ${missingAdrFiles.length} record(s) missing after authoring (${missingAdrFiles.join(', ')}) — retrying the missing writer(s).`)
+    await pooled(adrWriters.filter(w => missingAdrFiles.includes(w.file)).map(w => () => w.run()))
+    missingAdrFiles = await missingDocs(allAdrFiles, { label: 'adrs:verify', phase: 'ADRs' })
+  }
+  // Refuse to checkpoint 'adrs' over a missing ADR — the bug this guards against.
+  if (missingAdrFiles.length) return adrsIncomplete(missingAdrFiles)
   } else {
     const note = 'No architecturally significant decisions with observable evidence were found; no ADRs written.'
     log(`ℹ️  ${note}`); dropped.push(note)
@@ -2232,9 +2283,9 @@ if (stopAfter('critiqued', UNTIL)) return pausedAfter('critiqued', { ...finalCou
 if (budgetYieldNow()) return yieldForBudget('critiqued', { ...finalCounts, gapsRemaining: gaps.length })
 
 // ===========================================================================
-// Stage: Distill (opt-in) — emit a citation-free distilled/ mirror for the weaker
+// Stage: Distill (ON by default) — emit a citation-free distilled/ mirror for the weaker
 // rebuilder, after the critic has validated the cited kit. Skipped on a resume past
-// this stage. When DISTILL is off, this stage is inert and 'critiqued' is terminal.
+// this stage. With `distill: false` this stage is inert and 'critiqued' is terminal.
 // ===========================================================================
 let distill = null
 if (DISTILL) {
@@ -2256,5 +2307,7 @@ if (DISTILL) {
   // checkpoint that a plain /portkit would then have to clean up).
 }
 
-// Natural completion — assemble the final result and clear the checkpoint.
-return await finalize({ ordered, adrs: decisions, gaps, distill, extraCounts: finalCounts })
+// Natural completion — assemble the final result. The checkpoint is cleared ONLY when the terminal
+// 'distilled' stage ran; with `distill: false` (DISTILL off) it is deliberately KEPT so distillation
+// can still be completed later (all-phases-done is the sole condition for destroying the checkpoint).
+return await finalize({ ordered, adrs: decisions, gaps, distill, extraCounts: finalCounts, cleared: DISTILL })

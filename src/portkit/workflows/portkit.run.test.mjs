@@ -172,13 +172,23 @@ function makeRuntime(sc, store) {
       store.docs = store.docs || new Set(); store.docs.add(f)
       return 'ok'
     }
-    if (label === 'docs:verify') {
-      // Report which of the listed doc files are absent from store.docs (the on-disk model).
+    if (label.startsWith('adr:write:')) {
+      // ADR writers: the real agent writes <OUT>/adr/<file> and returns nothing structured. Model
+      // presence in store.docs (keyed by the relative `adr/…md` path parsed from the prompt), UNLESS
+      // configured to die. failAdrsOnce = transient; failAdrsAlways = persistent (file never written).
+      if (store.failAdrsAlways && store.failAdrsAlways.has(label)) return null
+      if (store.failAdrsOnce && store.failAdrsOnce.has(label)) { store.failAdrsOnce.delete(label); return null }
+      const m = prompt.match(/(adr\/[A-Za-z0-9_.-]+\.md)/)
+      if (m) { store.docs = store.docs || new Set(); store.docs.add(m[1]) }
+      return 'ok'
+    }
+    if (label === 'docs:verify' || label === 'adrs:verify') {
+      // Report which of the listed relative paths (docs OR adr/…) are absent from store.docs.
       const written = store.docs || new Set()
-      const files = [...new Set([...prompt.matchAll(/([A-Za-z0-9_.-]+\.md)`/g)].map(m => m[1]))]
+      const files = [...prompt.matchAll(/- `([^`]+)`/g)].map(m => m[1])
       return { missing: files.filter(f => !written.has(f)) }
     }
-    return 'ok' // adr:write, gapfix — no schema, return ignored
+    return 'ok' // gapfix — no schema, return ignored
   }
   const log = (m) => rec.logs.push(String(m))
   const phase = (p) => rec.phases.push(String(p))
@@ -756,10 +766,10 @@ test('no-budget regression: an unset budget yields never and completes in a sing
 })
 
 // ===========================================================================
-// Distill: citation-free distilled/ mirror for the weaker rebuilder (opt-in)
+// Distill: citation-free distilled/ mirror for the weaker rebuilder (default-on)
 // ===========================================================================
 
-test('distill: opt-in emits a citation-free distilled/ mirror of every consumer-facing doc', async () => {
+test('distill: emits a citation-free distilled/ mirror of every consumer-facing doc', async () => {
   const sc = scenario({
     features: ['e1', 'e2'], slicesPerFeature: 2, // 4 specs
     decisions: [
@@ -783,14 +793,48 @@ test('distill: opt-in emits a citation-free distilled/ mirror of every consumer-
   assert.equal(result.counts.residualCitations, 0)
 })
 
-test('distill: OFF by default — no distilled/ mirror, no distill agents', async () => {
+test('distill: ON by default — a full run emits the distilled/ mirror without asking', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 }) // 5 fixed + 2 specs = 7 docs
+  const store = {}
+  const { result, rec } = await run({ ...BASE }, sc, store) // distill NOT set ⇒ defaults ON
+  assert.equal(result.ok, true)
+  assert.ok(rec.labels.some(l => l.startsWith('distill:')), 'distill runs by default')
+  assert.equal(result.keyDocs.distilledDir, '/tmp/portkit-out/distilled/')
+  assert.equal(result.counts.distilledDocs, 7, '5 fixed docs + 2 specs')
+  assert.ok(rec.labels.includes('ir:clear'), 'the run still finalizes and clears the checkpoint')
+})
+
+test('distill: false opts OUT — no distilled/ mirror, and the checkpoint is RETAINED', async () => {
   const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
   const store = {}
-  const { result, rec } = await run({ ...BASE }, sc, store) // distill not set
-  assert.ok(!rec.labels.some(l => l.startsWith('distill:')), 'no distill agents run by default')
+  const { result, rec } = await run({ ...BASE, distill: false }, sc, store)
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false, 'opting out is a completed choice, not a resumable pause')
+  assert.ok(!rec.labels.some(l => l.startsWith('distill:')), 'distill:false runs no distill agents')
   assert.equal(store.distilled, undefined)
   assert.ok(!('distilledDir' in result.keyDocs))
   assert.ok(!('distilledDocs' in result.counts))
+  // The checkpoint is destroyed ONLY when every phase completed; distillation didn't, so it stays.
+  assert.equal(result.checkpointRetained, true, 'checkpoint retained when distillation is opted out')
+  assert.ok(!rec.labels.includes('ir:clear'), 'no ir:clear on a distill-opted-out run')
+  assert.ok(store.ir, 'checkpoint remains on disk')
+  assert.equal(store.ir.stage, 'critiqued', "checkpoint sits at the last completed stage, 'critiqued'")
+})
+
+test('distill: false then a later run distills from the RETAINED checkpoint and clears it', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = {}
+  const first = await run({ ...BASE, distill: false }, sc, store)
+  assert.equal(first.result.checkpointRetained, true)
+  assert.equal(store.ir.stage, 'critiqued')
+
+  // A re-run with distillation on resumes from 'critiqued', distills, and NOW clears (all phases done).
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.ok(rec.labels.some(l => l.startsWith('distill:')), 'distill runs on the resume')
+  assert.ok(!rec.labels.some(l => l.startsWith('discover:')), 'analysis is NOT re-run — resumed from checkpoint')
+  assert.ok(rec.labels.includes('ir:clear'), 'now that every phase is done, the checkpoint clears')
+  assert.equal(store.ir, undefined)
 })
 
 test('distill: residual citations are surfaced loudly, not hidden', async () => {
@@ -1040,6 +1084,56 @@ test('doc writer persistent death then resume once fixed: re-authors docs and co
   assert.equal(result.ok, true)
   assert.equal(result.resumeRequired, false)
   assert.ok(store.docs.has('PRD.md'), 'PRD.md is authored on the resume')
+  assert.ok(rec.labels.includes('ir:clear'), 'the completing resume clears the checkpoint')
+  assert.equal(store.ir, undefined)
+})
+
+// --- ADR writer gets the SAME guard as the doc family (verify → retry → gate 'adrs') --------
+const ADR_DECISIONS = [
+  { id: 'd1', title: 'Use SQLite for persistence', handle: 'use-sqlite', evidence: ['db.go:1'] },
+  { id: 'd2', title: 'Optimistic locking', handle: 'optimistic-locking', evidence: ['x.go:2'] },
+]
+test('ADR writer transient death: retried in-run, adrs completes, run finalizes', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1, decisions: [ADR_DECISIONS[0]] })
+  const store = { failAdrsOnce: new Set(['adr:write:1']) } // ADR writer dies once, succeeds on retry
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, true, 'a transient ADR-writer death recovers within the run')
+  assert.equal(result.resumeRequired, false)
+  assert.equal(rec.labels.filter(l => l === 'adr:write:1').length, 2, 'ADR writer was retried')
+  assert.ok(rec.labels.includes('adrs:verify'), 'ADRs are verified on disk before checkpointing')
+  assert.equal(result.counts.adrs, 1)
+  assert.ok(rec.labels.includes('ir:clear'), 'a complete run clears the checkpoint')
+})
+
+test('ADR writer persistent death: does NOT checkpoint adrs or finalize; checkpoint kept', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1, decisions: ADR_DECISIONS })
+  const store = { failAdrsAlways: new Set(['adr:write:2']) } // second ADR never writes its file
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, false, 'a missing ADR is NOT a successful run')
+  assert.equal(result.resumeRequired, false, 'already retried in-run ⇒ no auto-loop')
+  assert.equal(result.missingAdrs.length, 1)
+  assert.ok(result.missingAdrs[0].startsWith('adr/'), 'the missing ADR is named by its relative path')
+  // The checkpoint must NOT advance to 'adrs' (a resume would skip ADRs), and NOT clear.
+  assert.ok(!rec.labels.includes('ir:clear'), 'checkpoint must NOT be cleared with an ADR missing')
+  assert.equal(store.ir.stage, 'docs', "checkpoint stays at 'docs', never 'adrs'")
+  // ADRs run before spec-writing, so no specs were written past the failure.
+  assert.ok(!rec.labels.some(l => l.startsWith('slice:')), 'did not proceed to write specs')
+})
+
+test('ADR writer persistent death then resume once fixed: re-authors ADRs and completes', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1, decisions: ADR_DECISIONS })
+  const store = { failAdrsAlways: new Set(['adr:write:2']) }
+  const first = await run({ ...BASE }, sc, store)
+  assert.equal(first.result.ok, false)
+  assert.equal(store.ir.stage, 'docs')
+
+  // The writer recovers; a plain re-run resumes from 'docs' and re-authors the ADRs.
+  store.failAdrsAlways = new Set()
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.equal(result.counts.adrs, 2, 'both ADRs are authored on the resume')
   assert.ok(rec.labels.includes('ir:clear'), 'the completing resume clears the checkpoint')
   assert.equal(store.ir, undefined)
 })

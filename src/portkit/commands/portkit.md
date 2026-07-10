@@ -61,13 +61,18 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      held back for the finishing critic pass. Precedence: a runtime `+Nk` directive (`budget.total`)
      wins over `maxTokensPerRun`; with neither set, behavior is exactly as before (no pausing). Pair
      with `/loop /portkit …` to drive a huge project to completion across many budget-sized chunks.
-   - `distill` (default `false`): after the critic validates the kit, emit a **citation-free mirror**
-     under `<output>/distilled/` for the weaker downstream model that rebuilds from the docs. The
-     top-level docs keep their `path:line` source citations (useful to *you* for auditing grounding),
-     but those references point at source the rebuilder can't open — so the `distilled/` copy strips
-     them while keeping `[INFERRED]`/`[UNVERIFIED]` flags and real artifact paths. Point the rebuilder
-     at `distilled/`, keep the top level for review. Reported via `counts.distilledDocs` /
-     `counts.residualCitations` and `keyDocs.distilledDir`.
+   - `distill` (**default `true`** — pass `distill: false` to opt out): after the critic validates the
+     kit, emit a **citation-free mirror** under `<output>/distilled/` for the weaker downstream model
+     that rebuilds from the docs. The top-level docs keep their `path:line` source citations (useful to
+     *you* for auditing grounding), but those references point at source the rebuilder can't open — so
+     the `distilled/` copy strips them while keeping `[INFERRED]`/`[UNVERIFIED]` flags and real
+     artifact paths. **The `distilled/` mirror is the artifact the weaker model rebuilds from, so a
+     full run produces it by default**; point the rebuilder at `distilled/` and keep the top level for
+     review. Reported via `counts.distilledDocs` / `counts.residualCitations` and `keyDocs.distilledDir`.
+     Opting out (`distill: false`) yields the cited kit only, with `'critiqued'` as the terminal stage —
+     and because the checkpoint is destroyed **only when every phase completed**, an opted-out run
+     **keeps** its checkpoint (result: `checkpointRetained: true`). Run `/portkit-distill` (or re-run
+     without `distill: false`) later to add the mirror and finalize, or `--fresh` to discard it.
    - `limitSlices` (DEV/TEST ONLY, default `0` = unlimited): write only the first N slice specs
      (in build order) so a live run exercises the WHOLE pipeline (map → discover → synthesize →
      adrs → write → critic) cheaply. The output is a **partial, self-consistent TEST kit** —
@@ -95,7 +100,8 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
    - When `resumeRequired` is `false`, report the final summary: where the docs were written
      (`outDir`), the slice/ADR counts, any **truncations** (real coverage gaps — surface them),
      and the **remaining gaps**, especially `gapsRemainingHumanDecision`, which are items a human
-     must resolve.
+     must resolve. If `checkpointRetained` is `true` (distillation was opted out), also note that
+     the checkpoint is kept and `/portkit-distill` can still add the rebuilder mirror.
    - If `stoppedForBudget` is `true`, the run **voluntarily paused** because it reached its token
      budget (`maxTokensPerRun` or a `+Nk` directive), not because of an error. Treat it exactly like
      any other `resumeRequired` result — re-run (or `/loop`) to continue the next chunk. It reports
@@ -109,10 +115,11 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      every feature failed), do NOT blindly loop. Surface the `error` and `failedFeatures`; the
      checkpoint is still kept, so the user can investigate (rate limits, a bad `inputDir`) and then
      re-run to resume.
-   - If `ok` is `false` with a `missingDocs` list, a **doc-family writer died** (e.g. `PRD.md`) and
-     the file was still absent after an in-run retry. The workflow deliberately did NOT checkpoint
-     the `docs` stage (which would let a resume skip it) or finalize. Surface `missingDocs` and
-     re-run: it resumes from `synthesized` and re-authors the doc family.
+   - If `ok` is `false` with a `missingDocs` (or `missingAdrs`) list, a **doc-family or ADR writer
+     died** (e.g. `PRD.md`, or an `adr/ADR-NNNN-*.md`) and the file was still absent after an in-run
+     retry. The workflow deliberately did NOT checkpoint that stage (which would let a resume skip it)
+     or finalize. Surface the missing files and re-run: it resumes (from `synthesized` for docs, or
+     `docs` for ADRs) and re-authors the missing family.
    - If the run is **interrupted** (crash, timeout, spend limit, API outage), just re-run the same
      command: it checkpoints after every stage and resumes from where it stopped (see **Resuming**).
 

@@ -16,7 +16,8 @@ Requires the slice specs; advances the ladder to here if the checkpoint is earli
 for knobs, `/portkit-map` for the phase list.
 
 At this point the **cited kit is complete** (PRD, ARCHITECTURE, INDEX, ACCEPTANCE, specs, ADRs, risks).
-The optional citation-free rebuild mirror is a separate phase, `/portkit-distill`.
+In the step-by-step flow the citation-free rebuild mirror is the next, separate phase — run
+`/portkit-distill`. (A full `/portkit` run includes distillation automatically by default.)
 
 ## Arguments
 
