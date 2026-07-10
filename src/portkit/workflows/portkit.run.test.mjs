@@ -24,6 +24,10 @@ const SRC = join(HERE, 'portkit.js')
 const IR_OPEN = '<<<PORTKIT-IR-JSON>>>'
 const IR_CLOSE = '<<<END-PORTKIT-IR-JSON>>>'
 
+// Doc-family writer label → the file it writes under OUT. The mock records writes to model
+// on-disk presence so the DOC-VERIFY agent (docs:verify) can report genuinely-missing docs.
+const DOC_FILE = { index: 'INDEX.md', acceptance: 'ACCEPTANCE.md', arch: 'ARCHITECTURE.md', prd: 'PRD.md', glossary: 'GLOSSARY.md' }
+
 function compileWorkflow() {
   const src = readFileSync(SRC, 'utf8').replace(/^export\s+const\s+meta/m, 'const meta')
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
@@ -157,7 +161,24 @@ function makeRuntime(sc, store) {
       store.distilled.push(label.slice('distill:'.length))
       return { path: `distilled/${label.slice('distill:'.length)}`, residualCitations: store.residualPerDoc || 0 }
     }
-    return 'ok' // index, acceptance, arch, prd, adr:write, gapfix — no schema, return ignored
+    if (DOC_FILE[label]) {
+      // Doc-family writers: the REAL agents write <OUT>/<file> and return nothing structured.
+      // Model that by recording the file in store.docs — UNLESS configured to die (return null,
+      // leaving the file absent). failDocsOnce = transient (fails once, then succeeds on retry);
+      // failDocsAlways = persistent (never writes the file).
+      const f = DOC_FILE[label]
+      if (store.failDocsAlways && store.failDocsAlways.has(label)) return null
+      if (store.failDocsOnce && store.failDocsOnce.has(label)) { store.failDocsOnce.delete(label); return null }
+      store.docs = store.docs || new Set(); store.docs.add(f)
+      return 'ok'
+    }
+    if (label === 'docs:verify') {
+      // Report which of the listed doc files are absent from store.docs (the on-disk model).
+      const written = store.docs || new Set()
+      const files = [...new Set([...prompt.matchAll(/([A-Za-z0-9_.-]+\.md)`/g)].map(m => m[1]))]
+      return { missing: files.filter(f => !written.has(f)) }
+    }
+    return 'ok' // adr:write, gapfix — no schema, return ignored
   }
   const log = (m) => rec.logs.push(String(m))
   const phase = (p) => rec.phases.push(String(p))
@@ -970,6 +991,57 @@ test('discovery total failure (no forward progress): hard-stops without auto-res
   assert.deepEqual(result.failedFeatures, ['e1'])
   assert.ok(!rec.labels.includes('ir:clear'), 'checkpoint still kept for a manual retry')
   assert.ok(store.ir, 'checkpoint remains')
+})
+
+// --- doc-family writer must produce its file before 'docs' is checkpointed done ----------
+// A dead doc writer (agent()→null) leaves its file absent. Before, 'docs' was checkpointed
+// unconditionally, so a missing PRD.md was recorded DONE and a resume skipped docs forever.
+// Now the workflow verifies each doc on disk, retries the missing one, and refuses to
+// checkpoint 'docs' if a document is still absent.
+test('doc writer transient death: retried in-run, docs completes, run finalizes', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = { failDocsOnce: new Set(['prd']) } // PRD writer dies once, then succeeds on retry
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, true, 'a transient doc-writer death recovers within the run')
+  assert.equal(result.resumeRequired, false)
+  // PRD writer ran twice (initial death + retry); the docs stage verified on disk.
+  assert.equal(rec.labels.filter(l => l === 'prd').length, 2, 'PRD writer was retried')
+  assert.ok(rec.labels.includes('docs:verify'), 'docs are verified on disk before checkpointing')
+  assert.ok(store.docs.has('PRD.md'), 'PRD.md ends up present')
+  assert.ok(rec.labels.includes('ir:clear'), 'a complete run clears the checkpoint')
+})
+
+test('doc writer persistent death: does NOT checkpoint docs or finalize; checkpoint kept', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = { failDocsAlways: new Set(['prd']) } // PRD writer never writes its file
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, false, 'a missing document is NOT a successful run')
+  assert.equal(result.resumeRequired, false, 'already retried in-run ⇒ no auto-loop')
+  assert.deepEqual(result.missingDocs, ['PRD.md'], 'the missing document is named')
+  // The checkpoint must NOT advance to 'docs' (or a resume would skip docs forever), and NOT clear.
+  assert.ok(!rec.labels.includes('ir:clear'), 'checkpoint must NOT be cleared with a doc missing')
+  assert.equal(store.ir.stage, 'synthesized', "checkpoint stays at 'synthesized', never 'docs'")
+  // It never proceeded to write specs / finalize an incomplete kit.
+  assert.ok(!rec.labels.some(l => l.startsWith('slice:')), 'no specs written past the missing doc')
+})
+
+test('doc writer persistent death then resume once fixed: re-authors docs and completes', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = { failDocsAlways: new Set(['prd']) }
+  const first = await run({ ...BASE }, sc, store)
+  assert.equal(first.result.ok, false)
+  assert.equal(store.ir.stage, 'synthesized')
+
+  // The writer recovers; a plain re-run resumes from 'synthesized' and re-authors the doc family.
+  store.failDocsAlways = new Set()
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false)
+  assert.ok(store.docs.has('PRD.md'), 'PRD.md is authored on the resume')
+  assert.ok(rec.labels.includes('ir:clear'), 'the completing resume clears the checkpoint')
+  assert.equal(store.ir, undefined)
 })
 
 // --- critic respects INTENTIONAL test-scope omissions (limitSlices / maxFeatures) ---

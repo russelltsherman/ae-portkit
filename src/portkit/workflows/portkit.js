@@ -1215,6 +1215,26 @@ function discoveryIncomplete(failed, discoveredCount, progressed) {
   }
 }
 
+// docsIncomplete — the doc family is missing ≥1 document even AFTER an in-run retry (a writer agent
+// kept dying or leaving no file). Do NOT checkpoint 'docs' — that would let a resume SKIP the stage
+// and never regenerate the missing document (the reported bug) — and do NOT finalize/clear. Stop
+// with the checkpoint kept at 'synthesized'; a plain re-run re-authors the whole (idempotent) doc
+// family. resumeRequired:false: we already retried in-run, so we do NOT auto-loop — a human sees the
+// named missing document and re-runs (which resumes from the kept checkpoint).
+function docsIncomplete(missing) {
+  const err = `Doc family INCOMPLETE: ${missing.length} document(s) still missing after a retry — ${missing.join(', ')}. ` +
+    `The 'docs' stage was NOT checkpointed and \`${IR_PATH}\` was KEPT; re-run with { resume: true } pointed at ` +
+    `outputDir "${OUT}" to re-author the doc family.`
+  log(`⛔ ${err}`); dropped.push(err)
+  return {
+    ok: false, outDir: OUT, resumeRequired: false, stage: 'docs',
+    error: err, missingDocs: missing,
+    resumeArgs: { resume: true, outputDir: OUT },
+    counts: {},
+    truncations: dropped,
+  }
+}
+
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
@@ -1468,6 +1488,24 @@ async function clearIR() {
     `finished run: \`rm -rf "$(dirname "${IR_PATH}")"\`. Return when done.`,
     { phase: 'Checkpoint', label: 'ir:clear' }
   )
+}
+// missingDocs — VERIFY which of the doc-family files actually exist (and are non-empty) on disk.
+// The orchestrator sandbox can't stat files, so an agent lists them (like scanFeatureSidecars).
+// Used to GATE the 'docs' checkpoint: a dead writer agent leaves its file absent, and we must not
+// record the stage done over a missing document. Fail-SAFE: if the verify agent itself dies, treat
+// ALL files as missing (→ retry/pause) rather than falsely reporting the doc family complete.
+async function missingDocs(files) {
+  const r = await agent(
+    `You are the PortKit DOC-VERIFY agent. For EACH file below, check whether it EXISTS under \`${OUT}\` and is ` +
+    `NON-EMPTY:\n${files.map(f => `- \`${OUT}/${f}\``).join('\n')}\n\n` +
+    `Return \`{"missing": [ <the basenames that are ABSENT or EMPTY> ]}\` — basenames only (e.g. "PRD.md"); ` +
+    `an empty array means every file is present.`,
+    { schema: { type: 'object', properties: { missing: { type: 'array', items: { type: 'string' } } }, required: ['missing'] },
+      phase: 'Synthesize', label: 'docs:verify' }
+  )
+  const want = new Set(files)
+  if (!r || !Array.isArray(r.missing)) return [...files] // verify died ⇒ assume all missing (fail-safe)
+  return r.missing.filter(f => want.has(f))
 }
 // Resume helpers — completion is judged by the DURABLE ARTIFACTS on disk, not by the
 // checkpoint, so no already-finished agent is ever re-run even if the checkpoint lagged.
@@ -1989,82 +2027,79 @@ const indexData = {
     }),
   })),
 }
-await agent(
-  `You are the PortKit INDEX writer. ${rewriteClause(`${OUT}/INDEX.md`)} Write \`${OUT}/INDEX.md\` — the recreation roadmap — from the data below. ` +
-  `The build order and feature→slice tree are AUTHORITATIVE (computed deterministically) — do NOT reorder, ` +
-  `renumber, or invent, and transcribe every \`SL-\`/\`FEAT-\` id VERBATIM.\n\n` +
-  `CRITICAL — spec links: every slice object carries an exact \`spec\` field (e.g. \`specs/0001-....md\`). Use that ` +
-  `string VERBATIM as the markdown link target. Do NOT construct, slugify, shorten, or otherwise alter a spec path ` +
-  `yourself — the filenames are truncated and a hand-built link will not match the file on disk.\n\n` +
-  `${HOUSE_STYLE}\n\n${INDEX_TEMPLATE}\n\n` +
-  `DATA:\n${JSON.stringify(indexData, null, 2)}`,
-  { phase: 'Synthesize', label: 'index' }
-)
-
-// ACCEPTANCE writer — the single surface that flags coverage gaps loudly (each
-// slice spec's acceptance criteria are drawn from here). Written from the
-// extracted behavior data of the SURVIVING (post-merge) slices; agent invents nothing.
-// The surviving slices (light) + the behavior side-cars to pull their acceptance
-// criteria from. Criteria live in the per-feature behavior side-cars (written at
-// discovery), NOT in the checkpoint — the ACCEPTANCE writer reads them from disk.
-// Each survivor carries its canonical Slice ID + Feature ref for the writer to transcribe, plus
-// the raw `sliceKey` it uses to look the slice up in the behavior side-cars.
-// `sliceLabel` is the slice's spec-file form `SL-NNNN-<slug>` (specName minus `.md`) — precomputed
-// here so the Coverage Summary can show the slug-bearing id WITHOUT the writer re-slugifying the
-// name (slug() truncates to 48 chars, so a recomputed label would drift from the file on disk).
+// ACCEPTANCE data — the single surface that flags coverage gaps loudly (each slice spec's
+// acceptance criteria are drawn from here). Written from the extracted behavior data of the
+// SURVIVING (post-merge) slices; the writer invents nothing. Criteria live in the per-feature
+// behavior side-cars (written at discovery), NOT in the checkpoint — the writer reads them from
+// disk. Each survivor carries its canonical Slice ID + Feature ref plus the raw `sliceKey` it uses
+// to look the slice up. `sliceLabel` is the slice's spec-file form `SL-NNNN-<slug>` (specName minus
+// `.md`) — precomputed so the Coverage Summary shows the slug-bearing id WITHOUT the writer
+// re-slugifying the name (slug() truncates to 48 chars, so a recomputed label would drift from disk).
 const survivors = ordered.map(s => ({
   sliceId: sliceId(s.n), sliceLabel: specName(s.n, s.handle || s.name).replace(/\.md$/, ''),
   feature: featureRef(s.featureKey), name: s.name, sliceKey: s.id,
 }))
 const behaviorFiles = [...new Set(ordered.map(s => s.featureKey))].map(behaviorCarPath)
-await agent(
-  `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria.\n\n` +
-  `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceKey", "coverage", ` +
-  `"acceptanceCriteria", "testRefs" } ] }\`):\n${behaviorFiles.map(f => `- \`${f}\``).join('\n')}\n` +
-  `READ them and index by \`sliceKey\`. For EACH surviving slice below, emit its criteria/testRefs/coverage from ` +
-  `that index, NEVER by the raw sliceKey; if a slice's entry (or its file) is missing, treat coverage as 'none'. ` +
-  `In the Coverage Summary table, name each slice by its \`sliceLabel\` (the \`SL-NNNN-<slug>\` spec-file form) ` +
-  `with its \`feature\` first; in the by-feature criteria section, group by \`feature\` and name each slice by its ` +
-  `\`sliceId\`. Transcribe both VERBATIM. Use ONLY what the side-cars contain — do NOT invent criteria. Never paper ` +
-  `over missing coverage.\n\n` +
-  `${HOUSE_STYLE}\n\n${ACCEPTANCE_TEMPLATE}\n\n` +
-  `SURVIVING SLICES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
-  { phase: 'Synthesize', label: 'acceptance' }
-)
 
-// ARCHITECTURE writer — the system/tech spec. Absorbs the old system-map + kernel
-// glossary + cross-cutting conventions into one doc a weak model reads once and
-// every slice spec references (instead of restating).
-await agent(
-  `You are the PortKit ARCHITECTURE writer. ${rewriteClause(`${OUT}/ARCHITECTURE.md`)} Write \`${OUT}/ARCHITECTURE.md\` — the system/technical spec a weak ` +
-  `local model reads ONCE to understand how the pieces fit, then every slice spec references it.\n\n` +
-  `${HOUSE_STYLE}\n\n${ARCHITECTURE_TEMPLATE}\n\n` +
-  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
-  `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
-  { phase: 'Synthesize', label: 'arch' }
-)
-
-// PRD writer — product requirements RECONSTRUCTED from observed behavior. Intent
-// fields (goals/non-goals/metrics/users) are inferred and MUST be tagged; the
-// functional requirements are grounded (one per feature, cited).
-await agent(
-  `You are the PortKit PRD writer. ${rewriteClause(`${OUT}/PRD.md`)} Write \`${OUT}/PRD.md\` — a Product Requirements Document RECONSTRUCTED from ` +
-  `the observed behavior of the source (you are reverse-engineering; the source does not state its own intent).\n\n` +
-  `${HOUSE_STYLE}\n\n${PRD_TEMPLATE}\n\n` +
-  `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
-  `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
-  { phase: 'Synthesize', label: 'prd' }
-)
-
-// GLOSSARY writer — the kit's canonical vocabulary, so the weaker rebuilder (and any human
-// reader) knows exactly what Feature / Slice / SL-NNNN / FEAT-NN / ADR mean. Content is fixed
-// (GLOSSARY_TEMPLATE); the agent only needs to write it to disk (the sandbox can't).
-await agent(
-  `You are the PortKit GLOSSARY writer. ${rewriteClause(`${OUT}/GLOSSARY.md`)} Write \`${OUT}/GLOSSARY.md\` — the kit's ` +
-  `canonical vocabulary that every other document uses.\n\n${HOUSE_STYLE}\n\n${GLOSSARY_TEMPLATE}\n\n` +
-  `Write exactly that content to \`${OUT}/GLOSSARY.md\` (do not add or drop terms). Return when written.`,
-  { phase: 'Synthesize', label: 'glossary' }
-)
+// The doc family as RETRYABLE units keyed by output file. Before, all five ran fire-and-forget
+// and 'docs' was checkpointed unconditionally — so a dead writer (agent()→null, or one that
+// returned without writing) left its file ABSENT, the stage was recorded DONE, and a resume
+// SKIPPED docs forever, leaving e.g. a missing PRD.md (the reported bug). Now we author, VERIFY on
+// disk, retry the missing writers once, and refuse to checkpoint 'docs' if any file is still gone.
+const docWriters = [
+  { file: 'INDEX.md', run: () => agent(
+    `You are the PortKit INDEX writer. ${rewriteClause(`${OUT}/INDEX.md`)} Write \`${OUT}/INDEX.md\` — the recreation roadmap — from the data below. ` +
+    `The build order and feature→slice tree are AUTHORITATIVE (computed deterministically) — do NOT reorder, ` +
+    `renumber, or invent, and transcribe every \`SL-\`/\`FEAT-\` id VERBATIM.\n\n` +
+    `CRITICAL — spec links: every slice object carries an exact \`spec\` field (e.g. \`specs/0001-....md\`). Use that ` +
+    `string VERBATIM as the markdown link target. Do NOT construct, slugify, shorten, or otherwise alter a spec path ` +
+    `yourself — the filenames are truncated and a hand-built link will not match the file on disk.\n\n` +
+    `${HOUSE_STYLE}\n\n${INDEX_TEMPLATE}\n\n` +
+    `DATA:\n${JSON.stringify(indexData, null, 2)}`,
+    { phase: 'Synthesize', label: 'index' }) },
+  { file: 'ACCEPTANCE.md', run: () => agent(
+    `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria.\n\n` +
+    `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceKey", "coverage", ` +
+    `"acceptanceCriteria", "testRefs" } ] }\`):\n${behaviorFiles.map(f => `- \`${f}\``).join('\n')}\n` +
+    `READ them and index by \`sliceKey\`. For EACH surviving slice below, emit its criteria/testRefs/coverage from ` +
+    `that index, NEVER by the raw sliceKey; if a slice's entry (or its file) is missing, treat coverage as 'none'. ` +
+    `In the Coverage Summary table, name each slice by its \`sliceLabel\` (the \`SL-NNNN-<slug>\` spec-file form) ` +
+    `with its \`feature\` first; in the by-feature criteria section, group by \`feature\` and name each slice by its ` +
+    `\`sliceId\`. Transcribe both VERBATIM. Use ONLY what the side-cars contain — do NOT invent criteria. Never paper ` +
+    `over missing coverage.\n\n` +
+    `${HOUSE_STYLE}\n\n${ACCEPTANCE_TEMPLATE}\n\n` +
+    `SURVIVING SLICES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
+    { phase: 'Synthesize', label: 'acceptance' }) },
+  { file: 'ARCHITECTURE.md', run: () => agent(
+    `You are the PortKit ARCHITECTURE writer. ${rewriteClause(`${OUT}/ARCHITECTURE.md`)} Write \`${OUT}/ARCHITECTURE.md\` — the system/technical spec a weak ` +
+    `local model reads ONCE to understand how the pieces fit, then every slice spec references it.\n\n` +
+    `${HOUSE_STYLE}\n\n${ARCHITECTURE_TEMPLATE}\n\n` +
+    `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
+    `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
+    { phase: 'Synthesize', label: 'arch' }) },
+  { file: 'PRD.md', run: () => agent(
+    `You are the PortKit PRD writer. ${rewriteClause(`${OUT}/PRD.md`)} Write \`${OUT}/PRD.md\` — a Product Requirements Document RECONSTRUCTED from ` +
+    `the observed behavior of the source (you are reverse-engineering; the source does not state its own intent).\n\n` +
+    `${HOUSE_STYLE}\n\n${PRD_TEMPLATE}\n\n` +
+    `Source facts: ${sysFacts}\nSource root: \`${SOURCE}\`.\n\nFEATURES (transcribe each \`featureId\` verbatim):\n${JSON.stringify(featuresBrief, null, 2)}\n\n` +
+    `SLICES:\n${JSON.stringify(orderedBrief, null, 2)}\n\n${GROUND_RULE}\n\n${INFER_RULE}\n\nReturn when written.`,
+    { phase: 'Synthesize', label: 'prd' }) },
+  { file: 'GLOSSARY.md', run: () => agent(
+    `You are the PortKit GLOSSARY writer. ${rewriteClause(`${OUT}/GLOSSARY.md`)} Write \`${OUT}/GLOSSARY.md\` — the kit's ` +
+    `canonical vocabulary that every other document uses.\n\n${HOUSE_STYLE}\n\n${GLOSSARY_TEMPLATE}\n\n` +
+    `Write exactly that content to \`${OUT}/GLOSSARY.md\` (do not add or drop terms). Return when written.`,
+    { phase: 'Synthesize', label: 'glossary' }) },
+]
+const allDocFiles = docWriters.map(w => w.file)
+for (const w of docWriters) await w.run()
+let missingDocFiles = await missingDocs(allDocFiles)
+if (missingDocFiles.length) {
+  log(`⚠️  Doc family: ${missingDocFiles.length} document(s) missing after authoring (${missingDocFiles.join(', ')}) — retrying the missing writer(s).`)
+  for (const w of docWriters.filter(w => missingDocFiles.includes(w.file))) await w.run()
+  missingDocFiles = await missingDocs(allDocFiles)
+}
+// Refuse to checkpoint 'docs' over a missing document — that is the bug this guards against.
+if (missingDocFiles.length) return docsIncomplete(missingDocFiles)
   await saveStage('docs', {})
   didWorkThisTurn = true // the doc family (5 agents: INDEX/ACCEPTANCE/ARCHITECTURE/PRD/GLOSSARY) ran this turn
 }

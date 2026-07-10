@@ -109,6 +109,10 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      every feature failed), do NOT blindly loop. Surface the `error` and `failedFeatures`; the
      checkpoint is still kept, so the user can investigate (rate limits, a bad `inputDir`) and then
      re-run to resume.
+   - If `ok` is `false` with a `missingDocs` list, a **doc-family writer died** (e.g. `PRD.md`) and
+     the file was still absent after an in-run retry. The workflow deliberately did NOT checkpoint
+     the `docs` stage (which would let a resume skip it) or finalize. Surface `missingDocs` and
+     re-run: it resumes from `synthesized` and re-authors the doc family.
    - If the run is **interrupted** (crash, timeout, spend limit, API outage), just re-run the same
      command: it checkpoints after every stage and resumes from where it stopped (see **Resuming**).
 
