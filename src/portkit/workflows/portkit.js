@@ -29,18 +29,23 @@ const SOURCE = cfg.inputDir || cfg.sourcePath || '.'
 // Output dir. Preferred name: outputDir; legacy fallback: outDir. When unset it
 // defaults to a SIBLING of the input dir named "<inputDir>_portkit" (e.g.
 // /src/myapp -> /src/myapp_portkit), NEVER nested inside the input dir — nesting
-// pollutes the source tree (untracked files in the source's own repo). The
-// derivation is the pure, unit-tested `siblingOutDir` helper; the only impurity
-// here is reading the cwd for the "." (no-input) case. NOTE: the Workflow sandbox
-// exposes no Node API, so process.cwd() usually throws here — which is why the
-// /portkit command resolves an ABSOLUTE input path up front and passes it
-// explicitly, so `siblingOutDir` receives a real parent and yields a true sibling.
-// The cwd read below is a best-effort convenience for runtimes that do expose it.
+// pollutes the source tree (untracked files in the source's own repo). The full
+// precedence lives in the pure, unit-tested `resolveOutputDir` helper (inside the
+// deterministic fence); the only impurity out here is obtaining the cwd.
+//
+// cwd CHANNEL: the Workflow sandbox exposes no Node API, so process.cwd() usually
+// throws here (same disabled bucket as Date.now/Math.random). The /portkit command
+// layer DOES have a shell, so it captures `pwd` and passes it as an explicit
+// `cfg.cwd` arg — the deterministic channel the sandbox trusts. We prefer that arg
+// and fall back to a best-effort process.cwd() only for runtimes that do expose it.
+// If NEITHER is available and the input is "." (no absolute parent to derive a
+// sibling from), the output dir is unresolvable: we THROW with remediation rather
+// than silently writing a wrong `portkit_portkit` tree INSIDE the source.
 const OUT = (() => {
-  if (cfg.outputDir || cfg.outDir) return cfg.outputDir || cfg.outDir
-  let cwd = ''
-  try { cwd = String(process.cwd()) } catch { /* sandbox: no Node API — command supplies an abs path */ }
-  return siblingOutDir(SOURCE, cwd)
+  const cwd = cfg.cwd ?? (() => { try { return String(process.cwd()) } catch { return '' } })()
+  const { outDir, reason } = resolveOutputDir(cfg, cwd)
+  if (outDir === null) throw new Error(`[portkit] ${reason}`)
+  return outDir
 })()
 
 // ---------------------------------------------------------------------------
@@ -227,6 +232,33 @@ function siblingOutDir(inputDir, cwd) {
     return c ? `${c}_portkit` : 'portkit_portkit'
   }
   return `${base}_portkit`.replace(/^\.\//, '')
+}
+
+// resolveOutputDir — the SINGLE precedence for a run's output directory. Pure (cwd
+// is passed in, never read here), so it is unit-tested exactly like siblingOutDir,
+// and it cannot throw at region-eval time. Returns `{ outDir, reason }`:
+//   1. explicit cfg.outputDir || cfg.outDir            -> return it verbatim.
+//   2. else the SIBLING of the input (siblingOutDir).
+//   3. UNRESOLVABLE — input is "." / "" (i.e. "the cwd") AND cwd is empty — there is
+//      no absolute parent to hang a sibling off, so return `{ outDir: null, reason }`
+//      INSTEAD of siblingOutDir's `portkit_portkit` sentinel. The impure caller turns
+//      that null into a loud throw, so we never silently nest a wrong tree inside the
+//      source. (siblingOutDir keeps the sentinel as its raw last resort; it is simply
+//      unreachable through this precedence.)
+function resolveOutputDir(cfg, cwd) {
+  const c = cfg || {}
+  const explicit = c.outputDir || c.outDir
+  if (explicit) return { outDir: String(explicit), reason: '' }
+  const source = c.inputDir || c.sourcePath || '.'
+  const base = String(source).replace(/\/+$/, '')
+  const cwdStr = String(cwd == null ? '' : cwd).replace(/\/+$/, '')
+  if ((base === '' || base === '.') && cwdStr === '') {
+    return {
+      outDir: null,
+      reason: "cannot resolve an output directory: input is '.' and no cwd is available — pass an absolute inputDir, an explicit outputDir, or a cwd arg",
+    }
+  }
+  return { outDir: siblingOutDir(source, cwd), reason: '' }
 }
 
 // parseArgs — normalize the workflow's `args` input into a plain config object,

@@ -986,6 +986,29 @@ test('default output dir is a _portkit SIBLING of the input, never nested inside
   )
 })
 
+test('explicit cwd arg wins over the sandbox process.cwd() for the default sibling', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1 })
+  const store = {}
+  // The command layer passes the shell `pwd` as an explicit cwd channel. It must be
+  // preferred over the ambient process.cwd(), so the sibling is derived from the
+  // analyzed project's cwd, not wherever the sandbox happens to run.
+  const { result } = await run({ inputDir: '.', cwd: '/some/project', until: 'mapped' }, sc, store)
+  assert.equal(result.outDir, '/some/project_portkit')
+  assert.notEqual(result.outDir, `${process.cwd()}_portkit`, 'the cwd arg must override process.cwd()')
+})
+
+test('input "." with an empty cwd arg THROWS loudly — never writes portkit_portkit', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 1 })
+  const store = {}
+  // cwd: '' is a present-but-empty channel (nullish-coalescing keeps it, so process.cwd()
+  // is NOT consulted): the input is '.' and there is no parent, so the run must abort at
+  // startup with a remediation error instead of silently nesting portkit_portkit.
+  await assert.rejects(
+    run({ inputDir: '.', cwd: '', until: 'mapped' }, sc, store),
+    /cannot resolve an output directory/,
+  )
+})
+
 // --- discovery agent death must NEVER finalize / clear the checkpoint --------------------
 // A dead discovery agent (agent() → null) left no side-cars for its feature. The run must NOT
 // synthesize/write/finalize an incomplete kit (which would silently drop the feature AND clear

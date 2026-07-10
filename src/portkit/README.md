@@ -55,6 +55,15 @@ Examples:
 - **`--output <dir>`** — where docs are written. Default `<input-dir>_portkit` (a sibling of the
   input dir; output is never nested inside the source tree).
 
+> **cwd handoff (why the command captures `pwd`).** The default sibling output dir is derived from the
+> current directory, but the workflow runs in a sandbox with **no cwd access** (`process.cwd()` is
+> disabled there, alongside `Date.now()`/`Math.random()`, to keep resume caching reproducible). So the
+> command layer captures the shell `pwd` and passes it as an explicit `cwd` arg — the deterministic
+> channel the sandbox uses to compute `<cwd>_portkit`. It also resolves the input to an absolute path
+> for the analysis agents. If the output dir is genuinely unresolvable (no `--output`, no absolute
+> input, **and** no `cwd`), the run **aborts loudly** rather than silently writing `portkit_portkit`
+> inside the source tree.
+
 > **Prerequisite:** the Workflow tool (part of Claude Code) must be available. It is enabled via your
 > Claude settings — there is no `CLAUDE_CODE_WORKFLOWS` shell env var to set. If a run errors because
 > workflows are unavailable, enable them in Claude Code.

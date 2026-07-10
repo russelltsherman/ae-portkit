@@ -22,9 +22,12 @@ Raw arguments: `$ARGUMENTS`
 
 Parse them as `[input-dir] [--input <dir>] [--output <dir>]` exactly as `/portkit` does:
 - **input dir** — positional `[input-dir]` or `--input <dir>` (flag wins); defaults to `.`.
-  **Resolve it to an ABSOLUTE path with Bash** (`realpath "${dir:-.}"`) before invoking — never
-  pass a bare `.`. The workflow sandbox has no cwd access, so a bare `.` makes it write
-  `portkit_portkit` **inside** the input dir instead of a sibling beside it.
+  **Resolve it to an ABSOLUTE path with Bash** (`realpath "${dir:-.}"`) before invoking, for the
+  analysis agents. Separately, **capture the current dir with the shell builtin `CWD=$(pwd)` and pass
+  it as the `cwd` arg** — the deterministic channel the sandbox uses to derive the default sibling
+  output dir (the sandbox has no cwd access of its own). If the sandbox receives a bare `.` AND no
+  `cwd`, the run **aborts loudly** rather than silently writing `portkit_portkit` **inside** the
+  input dir.
 - **`--output <dir>`** — defaults to the sibling `<absolute-input-dir>_portkit`. All phase commands
   must resolve the SAME (absolute) output dir so they share one checkpoint
   (`<output>/.portkit/ir.json`).
@@ -40,7 +43,7 @@ Parse them as `[input-dir] [--input <dir>] [--output <dir>]` exactly as `/portki
    ```
    Workflow({
      scriptPath: "${CLAUDE_PLUGIN_ROOT}/workflows/portkit.js",
-     args: { inputDir: "...", outputDir: "...", until: "mapped" }
+     args: { inputDir: "...", outputDir: "...", cwd: "...", until: "mapped" }
    })
    ```
    Pass `fresh: true` if `--fresh` was given.

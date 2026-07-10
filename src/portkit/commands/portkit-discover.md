@@ -18,9 +18,11 @@ command simply advances the ladder from the start). See `/portkit` for the full 
 ## Arguments
 
 Raw arguments: `$ARGUMENTS` — parse `[input-dir] [--input <dir>] [--output <dir>]` as `/portkit` does.
-Resolve the SAME output dir used by the earlier phase so the shared checkpoint is found. Resolve the
-input dir to an ABSOLUTE path (`realpath "${dir:-.}"`), never a bare `.` — the sandbox has no cwd, so
-`.` writes inside the input dir.
+Resolve the SAME output dir used by the earlier phase so the shared checkpoint is found. **Capture the
+current dir with the shell builtin `CWD=$(pwd)` and pass it as the `cwd` arg** — the deterministic
+channel the sandbox uses to derive the default sibling output dir. Still resolve the input dir to an
+ABSOLUTE path (`realpath "${dir:-.}"`) for the analysis agents. If the sandbox gets a bare `.` AND no
+`cwd`, the run **aborts loudly** rather than silently writing `portkit_portkit` inside the source.
 
 ## Steps
 
@@ -32,7 +34,7 @@ input dir to an ABSOLUTE path (`realpath "${dir:-.}"`), never a bare `.` — the
    ```
    Workflow({
      scriptPath: "${CLAUDE_PLUGIN_ROOT}/workflows/portkit.js",
-     args: { inputDir: "...", outputDir: "...", until: "discovered" }
+     args: { inputDir: "...", outputDir: "...", cwd: "...", until: "discovered" }
    })
    ```
 

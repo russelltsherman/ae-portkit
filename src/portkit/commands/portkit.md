@@ -24,8 +24,11 @@ Parse them as: `[input-dir] [--input <dir>] [--output <dir>]`
   which the command resolves to an **absolute path** before invoking (see Steps) — the workflow
   sandbox has no cwd access, so it must receive a concrete path.
 - **`--output <dir>`** (optional): where to write the generated docs. Defaults to a **sibling** of
-  the (absolute) input dir named `<input-dir>_portkit` (e.g. `/src/myapp` → `/src/myapp_portkit`).
-  Output is never nested inside the input dir, so it does not pollute the source tree.
+  the input dir named `<input-dir>_portkit` (e.g. `/src/myapp` → `/src/myapp_portkit`). The command
+  passes the current dir (`pwd`) as an explicit `cwd` arg so the sandbox can derive that sibling
+  deterministically; if neither an `--output`, an absolute input, nor a `cwd` is available, the run
+  **aborts loudly** instead of guessing. Output is never nested inside the input dir, so it does not
+  pollute the source tree.
 
 When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
 
@@ -36,12 +39,17 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
    below errors because workflows are unavailable, enable them in Claude Code, then retry.
 
 2. **Build the args object** from the parsed arguments:
+   - `cwd`: **capture the current directory with the shell builtin `pwd`** (e.g. `CWD=$(pwd)`) and
+     pass it as an explicit `cwd` arg. This is the **deterministic channel** the sandbox trusts to
+     derive the default sibling output dir: the workflow runs in a sandbox with no cwd access of its
+     own (`process.cwd()` is disabled there, like `Date.now()`), so it relies on this arg. If it is
+     omitted **and** `inputDir` is a bare `.`, the run **aborts loudly** with a remediation message
+     rather than silently writing `portkit_portkit` **inside** the source tree.
    - `inputDir`: **resolve the input dir to an ABSOLUTE path** with Bash before invoking — take
      `--input` flag, else positional `[input-dir]`, else `.`, and run
-     `realpath "<that>"` (e.g. `INPUT=$(realpath "${dir:-.}")`). Pass the absolute result, never a
-     bare `.`. This matters: the workflow runs in a sandbox with no cwd access, so if it receives `.`
-     it cannot compute a sibling and writes `portkit_portkit` **inside** the input dir. Passing the
-     absolute path lets the default output land as a proper sibling.
+     `realpath "<that>"` (e.g. `INPUT=$(realpath "${dir:-.}")`). Pass the absolute result. This feeds
+     the analysis agents a concrete path and lets the default output land as a proper sibling even if
+     `cwd` were somehow missing.
    - `outputDir`: the `--output` value if given (also resolve it to absolute); otherwise omit it and
      let the workflow default to the sibling `<absolute-inputDir>_portkit`.
    - `fresh: true` (from `--fresh`): ignore any existing checkpoint at the output dir and reprocess
@@ -85,7 +93,7 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
    ```
    Workflow({
      scriptPath: "${CLAUDE_PLUGIN_ROOT}/workflows/portkit.js",
-     args: { inputDir: "...", outputDir: "..." }
+     args: { inputDir: "...", outputDir: "...", cwd: "..." }
    })
    ```
    The workflow runs in the background; watch it live with `/workflows`.
@@ -151,8 +159,11 @@ ignored (never a wrong-codebase resume), and it is deleted automatically when th
 ## Notes
 
 - Output lands in the sibling dir `<input-dir>_portkit/` by default, never inside the input dir —
-  the command resolves the input to an absolute path so the default output is a true sibling beside
-  it (a bare `.` would otherwise make the sandbox write `portkit_portkit` *inside* the source tree).
+  the command passes the current dir as an explicit `cwd` arg (and resolves the input to an absolute
+  path) so the default output is a true sibling beside it. The old failure mode — a bare `.` making
+  the sandbox silently write `portkit_portkit` *inside* the source tree — is gone: if the output dir
+  is genuinely unresolvable (no `cwd`, no absolute input, no `--output`) the run now **aborts loudly**
+  with a remediation message instead.
   The kit is **stack-neutral** — a PRD, an architecture spec, per-slice specs, MADR-style ADRs,
   and an acceptance-criteria rollup — so it describes what to rebuild without prescribing a target
   language.

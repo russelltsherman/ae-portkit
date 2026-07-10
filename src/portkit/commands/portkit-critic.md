@@ -22,8 +22,11 @@ In the step-by-step flow the citation-free rebuild mirror is the next, separate 
 ## Arguments
 
 Raw arguments: `$ARGUMENTS` — parse `[input-dir] [--input <dir>] [--output <dir>]` as `/portkit` does;
-resolve the SAME output dir as the earlier phases. Resolve the input dir to an ABSOLUTE path
-(`realpath "${dir:-.}"`), never a bare `.` — the sandbox has no cwd, so `.` writes inside the input dir.
+resolve the SAME output dir as the earlier phases. **Capture the current dir with the shell builtin
+`CWD=$(pwd)` and pass it as the `cwd` arg** — the deterministic channel the sandbox uses to derive the
+default sibling output dir. Still resolve the input dir to an ABSOLUTE path (`realpath "${dir:-.}"`) for
+the analysis agents. If the sandbox gets a bare `.` AND no `cwd`, the run **aborts loudly** rather than
+silently writing `portkit_portkit` inside the source.
 
 ## Steps
 
@@ -35,7 +38,7 @@ resolve the SAME output dir as the earlier phases. Resolve the input dir to an A
    ```
    Workflow({
      scriptPath: "${CLAUDE_PLUGIN_ROOT}/workflows/portkit.js",
-     args: { inputDir: "...", outputDir: "...", until: "critiqued" }
+     args: { inputDir: "...", outputDir: "...", cwd: "...", until: "critiqued" }
    })
    ```
 

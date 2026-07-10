@@ -14,8 +14,9 @@ These check the plugin is well-formed and the workflow is loadable. All currentl
 # unit + integration tests + a full-file syntax gate. Covers three layers:
 #  - portkit.deterministic.test.mjs — unit-tests the pure helpers in the
 #    <portkit:deterministic> region (topoSort, rewriteEdges, buildFeatureTree,
-#    projectAgents, planFeatureBatches, parseArgs), extracted from the file so the
-#    shipped code IS the tested code; plus a full-file async-wrap parse gate.
+#    projectAgents, planFeatureBatches, parseArgs, siblingOutDir, resolveOutputDir),
+#    extracted from the file so the shipped code IS the tested code; plus a full-file
+#    async-wrap parse gate.
 #  - portkit.run.test.mjs — RUNS the whole workflow body with a mock runtime
 #    (stub agent()/log()/phase()), validating the normal path, slice merging, the
 #    doc-family + ADR fan-out, staged checkpoint/auto-resume (resume from map,

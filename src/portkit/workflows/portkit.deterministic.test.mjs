@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote', 'checkDocStructure', 'docStructure', 'siblingOutDir']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote', 'checkDocStructure', 'docStructure', 'siblingOutDir', 'resolveOutputDir']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -600,9 +600,62 @@ test('siblingOutDir: "" behaves like "." (empty input == cwd)', () => {
 
 test('siblingOutDir: "." with unknown cwd falls back to literal portkit_portkit', () => {
   const { siblingOutDir } = loadDeterministic()
-  // Last resort when the sandbox exposes no cwd; the /portkit command resolves an
-  // absolute path up front so this nesting case is not reached in practice.
+  // siblingOutDir's RAW last resort when given no cwd. This sentinel is unreachable
+  // through the real run path: resolveOutputDir intercepts this exact case and returns
+  // { outDir: null } (see below) so the caller throws instead of nesting portkit_portkit.
   assert.equal(siblingOutDir('.', ''), 'portkit_portkit')
+})
+
+// --- resolveOutputDir: the SINGLE output-dir precedence, guards the unresolvable case ---
+test('resolveOutputDir: explicit outputDir wins over any input/cwd', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.deepEqual(
+    resolveOutputDir({ outputDir: '/explicit/out', inputDir: '/src/app' }, '/cwd'),
+    { outDir: '/explicit/out', reason: '' },
+  )
+})
+
+test('resolveOutputDir: legacy outDir alias is honored', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.equal(resolveOutputDir({ outDir: '/legacy/out' }, '').outDir, '/legacy/out')
+})
+
+test('resolveOutputDir: inputDir "." resolves against cwd to the ABSOLUTE sibling', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.deepEqual(
+    resolveOutputDir({ inputDir: '.' }, '/Users/me/proj'),
+    { outDir: '/Users/me/proj_portkit', reason: '' },
+  )
+})
+
+test('resolveOutputDir: absolute inputDir yields a sibling even with no cwd', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.equal(resolveOutputDir({ inputDir: '/src/myapp' }, '').outDir, '/src/myapp_portkit')
+})
+
+test('resolveOutputDir: sourcePath legacy input fallback is used', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.equal(resolveOutputDir({ sourcePath: '/src/legacy' }, '').outDir, '/src/legacy_portkit')
+})
+
+test('resolveOutputDir: input "." with no cwd is UNRESOLVABLE -> null (no portkit_portkit)', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  const r = resolveOutputDir({ inputDir: '.' }, '')
+  assert.equal(r.outDir, null, 'unresolvable case must be null, never the portkit_portkit sentinel')
+  assert.match(r.reason, /cwd/, 'reason must explain the missing cwd for remediation')
+})
+
+test('resolveOutputDir: empty input with no cwd is likewise unresolvable', () => {
+  const { resolveOutputDir } = loadDeterministic()
+  assert.equal(resolveOutputDir({}, '').outDir, null)
+})
+
+test('resolveOutputDir: cwd arrives via parseArgs (structured) and parseCliArgs (--cwd)', () => {
+  const { parseArgs } = loadDeterministic()
+  // Structured object is returned as-is, so cfg.cwd is present verbatim.
+  assert.equal(parseArgs({ inputDir: '.', cwd: '/w/proj' }).cwd, '/w/proj')
+  // CLI-string form: --cwd is an unaliased flag, so it passes through to cfg.cwd.
+  assert.equal(parseArgs('--input . --cwd /w/proj').cwd, '/w/proj')
 })
 
 // --- canonical DISPLAY ids (SL-/FEAT-/ADR-) — deterministic, user-facing, tested like specName ---
