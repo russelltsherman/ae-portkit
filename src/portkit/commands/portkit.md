@@ -100,6 +100,15 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
      budget (`maxTokensPerRun` or a `+Nk` directive), not because of an error. Treat it exactly like
      any other `resumeRequired` result — re-run (or `/loop`) to continue the next chunk. It reports
      the `stage` it paused at.
+   - If `ok` is `false` **with** `resumeRequired: true` and a `failedFeatures` list, one or more
+     **discovery agents died** mid-run. The workflow deliberately did NOT finalize an incomplete
+     kit or clear the checkpoint — it stopped so the dropped features are not lost. Re-invoke with
+     `resumeArgs` (or re-run the command): it auto-resumes and **re-discovers only the failed
+     features** (`failedFeatures`), then continues. Report which features are being retried.
+   - If `ok` is `false` **without** `resumeRequired` (e.g. discovery made **no** forward progress —
+     every feature failed), do NOT blindly loop. Surface the `error` and `failedFeatures`; the
+     checkpoint is still kept, so the user can investigate (rate limits, a bad `inputDir`) and then
+     re-run to resume.
    - If the run is **interrupted** (crash, timeout, spend limit, API outage), just re-run the same
      command: it checkpoints after every stage and resumes from where it stopped (see **Resuming**).
 

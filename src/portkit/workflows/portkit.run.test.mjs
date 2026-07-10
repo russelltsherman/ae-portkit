@@ -73,6 +73,10 @@ function makeRuntime(sc, store) {
       // The real agent WRITES the full slices (incl. thread) to a side-car AND a light
       // projection, then returns the slices; the workflow keeps only light fields.
       const e = label.slice('discover:'.length)
+      // Simulate a DEAD discovery agent (terminal API error after retries): agent() returns
+      // null and NO side-cars are written, exactly like a real mid-run death. The feature has
+      // no light.json, so it must be re-discovered on resume — never silently dropped.
+      if (store.failDiscover && store.failDiscover.has(e)) return null
       const slices = sc.slicesByFeature[e] || []
       store.files = store.files || {}
       const sp = (prompt.match(/`([^`]+\.slices\.json)`/) || [])[1]
@@ -915,6 +919,57 @@ test('default output dir is a _portkit SIBLING of the input, never nested inside
     !result.outDir.startsWith(`${process.cwd()}/`),
     'default output must not be nested inside the input dir',
   )
+})
+
+// --- discovery agent death must NEVER finalize / clear the checkpoint --------------------
+// A dead discovery agent (agent() → null) left no side-cars for its feature. The run must NOT
+// synthesize/write/finalize an incomplete kit (which would silently drop the feature AND clear
+// the only resume trail); it must stop with the checkpoint intact so a re-run re-discovers it.
+test('discovery agent death: does NOT finalize or clear the checkpoint; resumable', async () => {
+  const sc = scenario({ features: ['e1', 'e2', 'e3'], slicesPerFeature: 2 })
+  const store = { failDiscover: new Set(['e2']) }
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, false, 'a dropped feature is NOT a successful run')
+  assert.equal(result.resumeRequired, true, 'progress was made (e1,e3) ⇒ the run is resumable')
+  assert.deepEqual(result.failedFeatures, ['e2'], 'the failed feature is named, not swallowed')
+  assert.equal(result.counts.featuresFailed, 1)
+  // The checkpoint must be KEPT so a re-run can re-discover e2.
+  assert.ok(!rec.labels.includes('ir:clear'), 'checkpoint must NOT be cleared when a feature failed')
+  assert.ok(store.ir, 'checkpoint remains for resume')
+  // It stopped at discovery — never synthesized/wrote/finalized an incomplete kit.
+  assert.ok(!rec.labels.includes('synthesize'), 'did not synthesize an incomplete slice set')
+  assert.ok(!rec.labels.some(l => l.startsWith('slice:')), 'no specs written from an incomplete kit')
+})
+
+test('discovery agent death then resume: re-discovers ONLY the failed feature and completes', async () => {
+  const sc = scenario({ features: ['e1', 'e2', 'e3'], slicesPerFeature: 2 })
+  const store = { failDiscover: new Set(['e2']) }
+  const first = await run({ ...BASE }, sc, store)
+  assert.equal(first.result.resumeRequired, true)
+
+  // Transient death clears; a plain re-run auto-resumes from the kept checkpoint.
+  store.failDiscover = new Set()
+  const { result, rec } = await run({ ...BASE, resume: true }, sc, store)
+  assert.equal(result.ok, true)
+  assert.equal(result.resumeRequired, false)
+  // e1/e3 reloaded from durable side-cars; only e2 is re-discovered this pass.
+  assert.deepEqual(rec.labels.filter(l => l.startsWith('discover:')), ['discover:e2'],
+    'only the failed feature is re-discovered (structure/numbering preserved)')
+  assert.ok(rec.labels.includes('ir:clear'), 'a clean resume finalizes and clears the checkpoint')
+  assert.equal(store.ir, undefined, 'no checkpoint remains after the completing run')
+})
+
+test('discovery total failure (no forward progress): hard-stops without auto-resume, keeps checkpoint', async () => {
+  const sc = scenario({ features: ['e1'], slicesPerFeature: 2 })
+  const store = { failDiscover: new Set(['e1']) }
+  const { result, rec } = await run({ ...BASE }, sc, store)
+
+  assert.equal(result.ok, false)
+  assert.equal(result.resumeRequired, false, 'zero progress ⇒ no infinite auto-resume loop')
+  assert.deepEqual(result.failedFeatures, ['e1'])
+  assert.ok(!rec.labels.includes('ir:clear'), 'checkpoint still kept for a manual retry')
+  assert.ok(store.ir, 'checkpoint remains')
 })
 
 // --- critic respects INTENTIONAL test-scope omissions (limitSlices / maxFeatures) ---

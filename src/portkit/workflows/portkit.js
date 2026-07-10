@@ -1184,6 +1184,37 @@ function pausedAfter(stage, extraCounts = {}) {
   }
 }
 
+// discoveryIncomplete — one or more feature-discovery agents DIED this turn (agent() returned
+// null → filtered out of perFeatureDone), leaving NO side-cars for those features. Advancing
+// would synthesize, write, and finalize an INCOMPLETE kit and then clearIR() — silently
+// dropping the failed features AND destroying the only resume trail (the reported symptom).
+// Instead we STOP here with the checkpoint INTACT at 'discovering' (its last saveStage recorded
+// the successes): finalize()/clearIR() never run, so a plain re-run auto-resumes and
+// re-discovers ONLY the missing features (structure/numbering of the done ones is preserved).
+//   - progressed (≥1 feature discovered this turn) → resumeRequired:true so the /portkit command
+//     auto-re-invokes and retries the (usually transient) deaths.
+//   - no progress this turn → resumeRequired:false: a hard stop that avoids an infinite
+//     auto-resume loop when a feature fails deterministically. The checkpoint is STILL kept, so
+//     a manual re-run resumes; a human just gets to look first.
+function discoveryIncomplete(failed, discoveredCount, progressed) {
+  const ids = failed.map(f => f.id)
+  const err = `Discovery INCOMPLETE: ${failed.length} feature(s) failed to analyze (agent died) — ` +
+    `${ids.join(', ')}. The kit was NOT finalized and the checkpoint at \`${IR_PATH}\` was KEPT. ` +
+    (progressed
+      ? `Re-run (or /loop) with { resume: true } pointed at outputDir "${OUT}" to re-discover them.`
+      : `NO features were analyzed this pass — investigate before re-running; a plain re-run with ` +
+        `{ resume: true } pointed at outputDir "${OUT}" will resume from the checkpoint.`)
+  log(`⛔ ${err}`); dropped.push(err)
+  return {
+    ok: false, outDir: OUT, resumeRequired: progressed, stage: 'discovering',
+    error: err,
+    failedFeatures: ids,
+    resumeArgs: { resume: true, outputDir: OUT },
+    counts: { featuresDiscovered: discoveredCount, featuresFailed: failed.length },
+    truncations: dropped,
+  }
+}
+
 async function writeSliceDocs(sliceList) {
   const written = await pooled(sliceList.map((s) => () => {
     const path = sliceDocPath(s)
@@ -1764,9 +1795,12 @@ if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
   const doneIds = new Set(perFeatureDone.map(e => e && e.featureKey))
   const todo = features.filter(e => !doneIds.has(e.id))
   if (perFeatureDone.length) log(`Discovery resuming: ${perFeatureDone.length} done, ${todo.length} feature(ies) to analyze.`)
+  let discoveredThisTurn = 0 // features SUCCESSFULLY discovered this invocation (forward-progress signal)
   for (const group of chunk(todo, CHECKPOINT_EVERY)) {
     const results = await pooled(group.map((feature) => () => discoverFeature(feature, sysFacts)))
-    perFeatureDone.push(...results.filter(Boolean))
+    const ok = results.filter(Boolean)
+    perFeatureDone.push(...ok)
+    discoveredThisTurn += ok.length
     didWorkThisTurn = true // a discovery batch completed this turn — the progress guard is now armed
     // TINY checkpoint: advance the stage + record only WHICH features are done
     // (their ids). The slice data itself lives in the durable side-cars, never here.
@@ -1776,6 +1810,14 @@ if (!(RESUMING && stageDone(savedStage, 'discovered'))) {
     // very large project. The just-checkpointed batch is durable before we stop.
     if (budgetYieldNow()) return yieldForBudget('discovering', { featuresDiscovered: perFeatureDone.length })
   }
+  // A DEAD discovery agent (agent() → null) is filtered out above and left NO side-cars, so its
+  // feature has no light.json. If ANY feature failed, DO NOT advance to 'discovered' — that would
+  // synthesize/write/finalize an incomplete kit and clearIR() over it, silently dropping the
+  // failed features AND the resume trail. Stop with the checkpoint intact at 'discovering' so a
+  // re-run re-discovers ONLY the missing features (the durable ones are reloaded, never renumbered).
+  const doneNow = new Set(perFeatureDone.map(e => e && e.featureKey))
+  const failedFeatures = features.filter(e => !doneNow.has(e.id))
+  if (failedFeatures.length) return discoveryIncomplete(failedFeatures, perFeatureDone.length, discoveredThisTurn > 0)
   await saveStage('discovered', { featuresDone: perFeatureDone.map(e => e.featureKey) })
   if (budgetYieldNow()) return yieldForBudget('discovered', { featuresDiscovered: perFeatureDone.length })
 }
