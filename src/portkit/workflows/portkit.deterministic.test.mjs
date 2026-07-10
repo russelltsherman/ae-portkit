@@ -666,6 +666,19 @@ test('doc-family templates are all defined with their signature headings', () =>
   assert.ok(FULL_SRC.includes('## Coverage Summary'), 'ACCEPTANCE heading present')
 })
 
+test('ACCEPTANCE Coverage Summary: Feature column first, Slice second, slug-bearing slice label', () => {
+  // Column order must read Feature | Slice | Coverage (Feature before Slice).
+  assert.ok(
+    FULL_SRC.includes('`Feature (FEAT-NN) | Slice | Coverage (good/thin/none)`'),
+    'Coverage Summary columns are ordered Feature, then Slice, then Coverage',
+  )
+  // The Slice cell must use the slug-bearing spec-file form, not the bare SL-NNNN.
+  assert.ok(FULL_SRC.includes('SL-NNNN-<slug>'), 'Coverage Summary slice cell uses SL-NNNN-<slug>')
+  // The writer must be fed a precomputed sliceLabel so it never re-slugifies (truncation drift).
+  assert.match(FULL_SRC, /sliceLabel:\s*specName\(s\.n, s\.handle \|\| s\.name\)\.replace\(\/\\\.md\$\/, ''\)/,
+    'survivors carry a precomputed sliceLabel derived from specName')
+})
+
 test('regression: the old free-form "Include, in this order" checklist is gone', () => {
   assert.ok(!FULL_SRC.includes('Include, in this order:'),
     'writers must fill the rigid skeleton, not a free-form content checklist')

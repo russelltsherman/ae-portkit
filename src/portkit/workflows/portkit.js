@@ -808,8 +808,11 @@ const ACCEPTANCE_TEMPLATE =
   'SECTION SKELETON — reproduce these headings EXACTLY and in this order:\n\n' +
   '# Acceptance Criteria\n\n' +
   '## Coverage Summary\n' +
-  'A table `Slice (SL-NNNN) | Feature (FEAT-NN) | Coverage (good/thin/none)`, LOUDLY flagging every ' +
-  'thin/none slice as a rebuild risk.\n\n' +
+  'A table with columns in THIS order: `Feature (FEAT-NN) | Slice | Coverage (good/thin/none)`. ' +
+  'Feature FIRST, Slice SECOND. For the Slice cell, use the slice\'s full `sliceLabel` (the ' +
+  '`SL-NNNN-<slug>` spec-file form, e.g. `SL-0003-token-refresh`) transcribed VERBATIM — do NOT ' +
+  'shorten it to the bare `SL-NNNN` and do NOT re-slugify the name. LOUDLY flag every thin/none ' +
+  'slice as a rebuild risk.\n\n' +
   '## Acceptance Criteria by Feature\n' +
   'Grouped by feature (`FEAT-NN`); for each slice (`SL-NNNN`) its criteria with source test `path:line` refs.'
 
@@ -1964,15 +1967,23 @@ await agent(
 // discovery), NOT in the checkpoint — the ACCEPTANCE writer reads them from disk.
 // Each survivor carries its canonical Slice ID + Feature ref for the writer to transcribe, plus
 // the raw `sliceKey` it uses to look the slice up in the behavior side-cars.
-const survivors = ordered.map(s => ({ sliceId: sliceId(s.n), feature: featureRef(s.featureKey), name: s.name, sliceKey: s.id }))
+// `sliceLabel` is the slice's spec-file form `SL-NNNN-<slug>` (specName minus `.md`) — precomputed
+// here so the Coverage Summary can show the slug-bearing id WITHOUT the writer re-slugifying the
+// name (slug() truncates to 48 chars, so a recomputed label would drift from the file on disk).
+const survivors = ordered.map(s => ({
+  sliceId: sliceId(s.n), sliceLabel: specName(s.n, s.handle || s.name).replace(/\.md$/, ''),
+  feature: featureRef(s.featureKey), name: s.name, sliceKey: s.id,
+}))
 const behaviorFiles = [...new Set(ordered.map(s => s.featureKey))].map(behaviorCarPath)
 await agent(
   `You are the PortKit ACCEPTANCE writer. ${rewriteClause(`${OUT}/ACCEPTANCE.md`)} Write \`${OUT}/ACCEPTANCE.md\`: the full extracted acceptance criteria.\n\n` +
   `The criteria are in these behavior side-car files (JSON, each \`{ "perSlice": [ { "sliceKey", "coverage", ` +
   `"acceptanceCriteria", "testRefs" } ] }\`):\n${behaviorFiles.map(f => `- \`${f}\``).join('\n')}\n` +
   `READ them and index by \`sliceKey\`. For EACH surviving slice below, emit its criteria/testRefs/coverage from ` +
-  `that index (label it by its \`sliceId\`/\`feature\`, NOT the raw sliceKey); if a slice's entry (or its file) is ` +
-  `missing, treat coverage as 'none'. Use ONLY what the side-cars contain — do NOT invent criteria. Never paper ` +
+  `that index, NEVER by the raw sliceKey; if a slice's entry (or its file) is missing, treat coverage as 'none'. ` +
+  `In the Coverage Summary table, name each slice by its \`sliceLabel\` (the \`SL-NNNN-<slug>\` spec-file form) ` +
+  `with its \`feature\` first; in the by-feature criteria section, group by \`feature\` and name each slice by its ` +
+  `\`sliceId\`. Transcribe both VERBATIM. Use ONLY what the side-cars contain — do NOT invent criteria. Never paper ` +
   `over missing coverage.\n\n` +
   `${HOUSE_STYLE}\n\n${ACCEPTANCE_TEMPLATE}\n\n` +
   `SURVIVING SLICES:\n${JSON.stringify(survivors, null, 2)}\n\n${GROUND_RULE}`,
