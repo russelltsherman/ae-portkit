@@ -1,6 +1,5 @@
 {
   "name": "ae-portkit",
-  "version": "0.5.4",
   "private": true,
   "description": "PortKit Claude Code plugin — workflow + deterministic-helper unit tests",
   "type": "module",
