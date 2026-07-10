@@ -900,14 +900,21 @@ test('a full /portkit run (no until) is unaffected: never pauses, still clears t
   assert.equal(store.ir, undefined, 'full run clears the checkpoint as before')
 })
 
-test('default output dir uses the _portkit suffix (never _recreation)', async () => {
+test('default output dir is a _portkit SIBLING of the input, never nested inside it', async () => {
   const sc = scenario({ features: ['e1'], slicesPerFeature: 1 })
   const store = {}
-  // No outputDir passed -> the workflow derives it from the input/cwd with a _portkit suffix.
+  // No outputDir passed -> the workflow derives it from the input/cwd with a _portkit
+  // suffix. With inputDir '.' and a real cwd (this test process), the default is the
+  // ABSOLUTE sibling `<cwd>_portkit` — a peer of the cwd, not a child of it.
   const { result } = await run({ inputDir: '.', until: 'mapped' }, sc, store)
   assert.equal(result.paused, true)
   assert.match(result.outDir, /_portkit$/, 'default output dir ends with _portkit')
   assert.ok(!/_recreation/.test(result.outDir), 'the old _recreation suffix is gone')
+  assert.equal(result.outDir, `${process.cwd()}_portkit`, 'default output is the cwd sibling')
+  assert.ok(
+    !result.outDir.startsWith(`${process.cwd()}/`),
+    'default output must not be nested inside the input dir',
+  )
 })
 
 // --- critic respects INTENTIONAL test-scope omissions (limitSlices / maxFeatures) ---

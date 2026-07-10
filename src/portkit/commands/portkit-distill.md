@@ -19,7 +19,8 @@ this is the last phase it runs to natural completion rather than pausing. See `/
 ## Arguments
 
 Raw arguments: `$ARGUMENTS` — parse `[input-dir] [--input <dir>] [--output <dir>]` as `/portkit` does;
-resolve the SAME output dir as the earlier phases.
+resolve the SAME output dir as the earlier phases. Resolve the input dir to an ABSOLUTE path
+(`realpath "${dir:-.}"`), never a bare `.` — the sandbox has no cwd, so `.` writes inside the input dir.
 
 ## Steps
 

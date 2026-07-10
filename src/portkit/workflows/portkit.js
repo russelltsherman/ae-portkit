@@ -28,21 +28,19 @@ const cfg = parseArgs(args)
 const SOURCE = cfg.inputDir || cfg.sourcePath || '.'
 // Output dir. Preferred name: outputDir; legacy fallback: outDir. When unset it
 // defaults to a SIBLING of the input dir named "<inputDir>_portkit" (e.g.
-// /src/myapp -> /src/myapp_portkit). We deliberately do NOT nest output inside
-// the input dir — that pollutes the source tree (it shows up as untracked files
-// in the source's own repo). When inputDir is unset SOURCE is "." (the cwd); we
-// resolve the cwd's OWN directory name and suffix that, so analyzing a project
-// dir named "portkit" defaults to "portkit_portkit". If the runtime does not
-// expose the cwd, fall back to the literal "portkit_portkit".
+// /src/myapp -> /src/myapp_portkit), NEVER nested inside the input dir — nesting
+// pollutes the source tree (untracked files in the source's own repo). The
+// derivation is the pure, unit-tested `siblingOutDir` helper; the only impurity
+// here is reading the cwd for the "." (no-input) case. NOTE: the Workflow sandbox
+// exposes no Node API, so process.cwd() usually throws here — which is why the
+// /portkit command resolves an ABSOLUTE input path up front and passes it
+// explicitly, so `siblingOutDir` receives a real parent and yields a true sibling.
+// The cwd read below is a best-effort convenience for runtimes that do expose it.
 const OUT = (() => {
   if (cfg.outputDir || cfg.outDir) return cfg.outputDir || cfg.outDir
-  const base = SOURCE.replace(/\/+$/, '')
-  if (base === '.' || base === '') {
-    let cwdName = ''
-    try { cwdName = String(process.cwd()).replace(/\/+$/, '').split('/').pop() || '' } catch { /* no cwd access */ }
-    return `${cwdName || 'portkit'}_portkit`
-  }
-  return `${base}_portkit`.replace(/^\.\//, '')
+  let cwd = ''
+  try { cwd = String(process.cwd()) } catch { /* sandbox: no Node API — command supplies an abs path */ }
+  return siblingOutDir(SOURCE, cwd)
 })()
 
 // ---------------------------------------------------------------------------
@@ -206,6 +204,28 @@ function adrId(n) { return `ADR-${pad(n)}` }
 // filename unique regardless of handle collisions, and self-identifying at a glance.
 function specName(n, label) { return `${sliceId(n)}-${slug(label)}.md` }
 function adrName(n, label) { return `${adrId(n)}-${slug(label)}.md` }
+
+// siblingOutDir — the default output location for a given input dir: a SIBLING
+// named "<input>_portkit", never nested inside the input. Pure (cwd is passed in,
+// not read) so the "." case is deterministically testable.
+//   - input carries a parent path -> derive directly, preserving its form:
+//       "path/to/project"  -> "path/to/project_portkit"
+//       "/src/myapp"        -> "/src/myapp_portkit"
+//       "myapp"             -> "myapp_portkit"   (sibling in the same cwd)
+//   - "." / "" (the cwd itself) -> resolve against cwd -> "<cwd>_portkit"
+//       (an ABSOLUTE sibling when cwd is known).
+//   - "." / "" with cwd unknown -> last-resort bare "portkit_portkit". This is the
+//       ONLY case that would nest; the /portkit command avoids it by resolving an
+//       absolute input path before invoking the workflow.
+// Leading "./" is stripped so a "./project" input yields "project_portkit".
+function siblingOutDir(inputDir, cwd) {
+  const base = String(inputDir == null ? '' : inputDir).replace(/\/+$/, '')
+  if (base === '' || base === '.') {
+    const c = String(cwd == null ? '' : cwd).replace(/\/+$/, '')
+    return c ? `${c}_portkit` : 'portkit_portkit'
+  }
+  return `${base}_portkit`.replace(/^\.\//, '')
+}
 
 // parseArgs — normalize the workflow's `args` input into a plain config object,
 // no matter how it arrives. The slash command is SUPPOSED to hand us a structured

@@ -20,9 +20,11 @@ Raw arguments: `$ARGUMENTS`
 Parse them as: `[input-dir] [--input <dir>] [--output <dir>]`
 
 - **input dir** — the codebase root to analyze. Provide it either as the positional `[input-dir]`
-  or via `--input <dir>` (the flag wins if both are given). Defaults to the current directory (`.`).
+  or via `--input <dir>` (the flag wins if both are given). Defaults to the current directory (`.`),
+  which the command resolves to an **absolute path** before invoking (see Steps) — the workflow
+  sandbox has no cwd access, so it must receive a concrete path.
 - **`--output <dir>`** (optional): where to write the generated docs. Defaults to a **sibling** of
-  the input dir named `<input-dir>_portkit` (e.g. `/src/myapp` → `/src/myapp_portkit`).
+  the (absolute) input dir named `<input-dir>_portkit` (e.g. `/src/myapp` → `/src/myapp_portkit`).
   Output is never nested inside the input dir, so it does not pollute the source tree.
 
 When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
@@ -34,9 +36,14 @@ When a path is ambiguous, prefer the explicit `--input` / `--output` flags.
    below errors because workflows are unavailable, enable them in Claude Code, then retry.
 
 2. **Build the args object** from the parsed arguments:
-   - `inputDir`: the resolved input dir (`--input` flag, else positional `[input-dir]`, else `"."`).
-   - `outputDir`: the `--output` value if given; otherwise omit it and let the workflow default to
-     `<inputDir>_portkit`.
+   - `inputDir`: **resolve the input dir to an ABSOLUTE path** with Bash before invoking — take
+     `--input` flag, else positional `[input-dir]`, else `.`, and run
+     `realpath "<that>"` (e.g. `INPUT=$(realpath "${dir:-.}")`). Pass the absolute result, never a
+     bare `.`. This matters: the workflow runs in a sandbox with no cwd access, so if it receives `.`
+     it cannot compute a sibling and writes `portkit_portkit` **inside** the input dir. Passing the
+     absolute path lets the default output land as a proper sibling.
+   - `outputDir`: the `--output` value if given (also resolve it to absolute); otherwise omit it and
+     let the workflow default to the sibling `<absolute-inputDir>_portkit`.
    - `fresh: true` (from `--fresh`): ignore any existing checkpoint at the output dir and reprocess
      from scratch (see **Resuming** below). Omit it for the normal auto-resume behavior.
    - Optional tuning knobs the user may pass through (only if they ask): `maxFeatures`, `maxAdrs`
@@ -123,7 +130,9 @@ ignored (never a wrong-codebase resume), and it is deleted automatically when th
 
 ## Notes
 
-- Output lands in the sibling dir `<input-dir>_portkit/` by default, never inside the input dir.
+- Output lands in the sibling dir `<input-dir>_portkit/` by default, never inside the input dir —
+  the command resolves the input to an absolute path so the default output is a true sibling beside
+  it (a bare `.` would otherwise make the sandbox write `portkit_portkit` *inside* the source tree).
   The kit is **stack-neutral** — a PRD, an architecture spec, per-slice specs, MADR-style ADRs,
   and an acceptance-criteria rollup — so it describes what to rebuild without prescribing a target
   language.

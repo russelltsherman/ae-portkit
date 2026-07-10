@@ -18,7 +18,9 @@ command simply advances the ladder from the start). See `/portkit` for the full 
 ## Arguments
 
 Raw arguments: `$ARGUMENTS` — parse `[input-dir] [--input <dir>] [--output <dir>]` as `/portkit` does.
-Resolve the SAME output dir used by the earlier phase so the shared checkpoint is found.
+Resolve the SAME output dir used by the earlier phase so the shared checkpoint is found. Resolve the
+input dir to an ABSOLUTE path (`realpath "${dir:-.}"`), never a bare `.` — the sandbox has no cwd, so
+`.` writes inside the input dir.
 
 ## Steps
 

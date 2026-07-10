@@ -19,7 +19,7 @@ const OPEN = '// <portkit:deterministic>'
 const CLOSE = '// </portkit:deterministic>'
 
 // Exported helper names the region is expected to define (grown as slices land).
-const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote', 'checkDocStructure', 'docStructure']
+const EXPORTS = ['topoSort', 'rewriteEdges', 'buildFeatureTree', 'projectAgents', 'planFeatureBatches', 'parseArgs', 'stageDone', 'stageIndex', 'stageList', 'stopAfter', 'stageAfter', 'chunk', 'slug', 'pad', 'specName', 'adrName', 'sliceId', 'featureId', 'adrId', 'budgetExhausted', 'findSourceCitations', 'planResume', 'omissionScopeNote', 'checkDocStructure', 'docStructure', 'siblingOutDir']
 
 function readRegion() {
   const src = readFileSync(SRC, 'utf8')
@@ -557,6 +557,52 @@ test('adrName: <ADR-ID>-<slug>.md, id-prefixed single source of truth', () => {
   assert.equal(adrName(1, 'two-file-persistence'), 'ADR-0001-two-file-persistence.md')
   assert.equal(adrName(5, 'write-acl-matrix'), 'ADR-0005-write-acl-matrix.md')
   assert.equal(adrName(5, 'write-acl-matrix'), `${adrId(5)}-${slug('write-acl-matrix')}.md`)
+})
+
+// --- siblingOutDir: default output is a SIBLING of the input, never nested -----
+test('siblingOutDir: relative path with a parent yields a sibling (not nested)', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('path/to/project', ''), 'path/to/project_portkit')
+})
+
+test('siblingOutDir: absolute path yields an absolute sibling', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('/src/myapp', ''), '/src/myapp_portkit')
+})
+
+test('siblingOutDir: bare name is a sibling in the same cwd', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('myapp', '/anything'), 'myapp_portkit')
+})
+
+test('siblingOutDir: trailing slashes on the input are trimmed', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('/src/myapp/', ''), '/src/myapp_portkit')
+})
+
+test('siblingOutDir: leading ./ is stripped so it is not written as ./x_portkit', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('./project', ''), 'project_portkit')
+})
+
+test('siblingOutDir: "." resolves against cwd to an ABSOLUTE sibling (not nested)', () => {
+  const { siblingOutDir } = loadDeterministic()
+  const out = siblingOutDir('.', '/Users/me/ae-portkit')
+  assert.equal(out, '/Users/me/ae-portkit_portkit')
+  // The whole point: it is a SIBLING, not nested inside the cwd.
+  assert.ok(!out.startsWith('/Users/me/ae-portkit/'), 'default output must not nest inside the input dir')
+})
+
+test('siblingOutDir: "" behaves like "." (empty input == cwd)', () => {
+  const { siblingOutDir } = loadDeterministic()
+  assert.equal(siblingOutDir('', '/w/proj'), '/w/proj_portkit')
+})
+
+test('siblingOutDir: "." with unknown cwd falls back to literal portkit_portkit', () => {
+  const { siblingOutDir } = loadDeterministic()
+  // Last resort when the sandbox exposes no cwd; the /portkit command resolves an
+  // absolute path up front so this nesting case is not reached in practice.
+  assert.equal(siblingOutDir('.', ''), 'portkit_portkit')
 })
 
 // --- canonical DISPLAY ids (SL-/FEAT-/ADR-) — deterministic, user-facing, tested like specName ---
